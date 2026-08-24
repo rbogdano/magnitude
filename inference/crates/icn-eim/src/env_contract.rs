@@ -20,7 +20,20 @@ use serde_json::{Map, Value, json};
 use crate::docker::cli::ProxySettings;
 
 /// In-container weight cache, matching EIM's default `INFERENCE_CACHE_PATH`.
+///
+/// Only consulted for weights that are *already* laid out here. When they are absent EIM passes
+/// the bare model identifier through and lets the engine download, which is why the Hugging Face
+/// cache below must also be mounted.
 pub const CONTAINER_CACHE_PATH: &str = "/workspace/model-cache";
+
+/// The engine's own Hugging Face cache inside the container.
+///
+/// Mounting this is not an optimization. Without it a model absent from the Local Directory
+/// layout downloads into the container's ephemeral filesystem -- verified on a real run, where
+/// 13 GB landed here while the mounted cache stayed empty -- and is lost the moment the
+/// container is removed, so every start re-downloads the whole model. EIM's own quickstart
+/// mounts this path for the same reason.
+pub const CONTAINER_HF_CACHE_PATH: &str = "/root/.cache/huggingface";
 
 /// EIM's own port. Never overridden: the base image's `HEALTHCHECK` hardcodes
 /// `localhost:8000`, so a different in-container port would leave the container
@@ -139,6 +152,15 @@ impl LaunchEnvironment {
     pub fn cache_mount(&self, host_cache_path: &str) -> String {
         let mode = if self.offline_weights { "ro" } else { "rw" };
         format!("{host_cache_path}:{CONTAINER_CACHE_PATH}:{mode}")
+    }
+
+    /// The mount argument for the engine's Hugging Face cache.
+    ///
+    /// Writable while the container may download, otherwise the download fails partway.
+    #[must_use]
+    pub fn hf_cache_mount(&self, host_hf_cache_path: &str) -> String {
+        let mode = if self.offline_weights { "ro" } else { "rw" };
+        format!("{host_hf_cache_path}:{CONTAINER_HF_CACHE_PATH}:{mode}")
     }
 }
 

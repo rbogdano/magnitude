@@ -115,8 +115,12 @@ impl EimModelDefinition {
 pub struct EimControllerConfig {
     /// The `--instance-id` this ICN was started with, written onto every container.
     pub icn_instance_id: String,
-    /// Host directory mounted as the in-container weight cache.
+    /// Host directory mounted as the in-container weight cache, in EIM's Local Directory layout.
     pub host_cache_path: PathBuf,
+    /// Host directory mounted as the engine's Hugging Face cache. Required: without it a model
+    /// not already in the Local Directory layout downloads into the container's ephemeral
+    /// filesystem and is re-downloaded on every start.
+    pub host_hf_cache_path: PathBuf,
     pub proxy: ProxySettings,
     /// Only needed for gated repositories.
     pub hf_token: Option<String>,
@@ -142,6 +146,7 @@ impl Default for EimControllerConfig {
         Self {
             icn_instance_id: "standalone".to_owned(),
             host_cache_path: PathBuf::from("/var/lib/magnitude/eim/model-cache"),
+            host_hf_cache_path: PathBuf::from("/var/lib/magnitude/eim/hf-cache"),
             proxy: ProxySettings::from_environment(),
             hf_token: std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty()),
             readiness: ReadinessConfig::default(),

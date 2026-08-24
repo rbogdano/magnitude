@@ -76,6 +76,7 @@ fn controller(image: &str) -> EimModelInstanceController {
         EimControllerConfig {
             icn_instance_id: format!("itest-{}", std::process::id()),
             host_cache_path: PathBuf::from("/tmp/magnitude-eim-itest-cache"),
+            host_hf_cache_path: PathBuf::from("/tmp/magnitude-eim-itest-hf"),
             readiness: ReadinessConfig {
                 poll_interval: Duration::from_millis(250),
                 deadline: Duration::from_secs(90),
@@ -327,6 +328,7 @@ async fn a_container_that_fails_to_start_is_classified_from_its_log() {
         EimControllerConfig {
             icn_instance_id: format!("itest-fail-{}", std::process::id()),
             host_cache_path: PathBuf::from("/tmp/magnitude-eim-itest-cache"),
+            host_hf_cache_path: PathBuf::from("/tmp/magnitude-eim-itest-hf"),
             readiness: ReadinessConfig {
                 poll_interval: Duration::from_millis(250),
                 deadline: Duration::from_secs(60),
