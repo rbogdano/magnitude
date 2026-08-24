@@ -26,6 +26,8 @@ use icn_contracts::bootstrap_protocol::{
     IcnStartupRecordType,
 };
 use icn_contracts::{HardwareProvider, HardwareSnapshot, InventoryError};
+use icn_eim::controller::{EimControllerConfig, EimModelDefinition, EimModelInstanceController};
+use icn_eim::docker::cli::ProxySettings;
 use icn_eim::docker::{DockerCli, DockerPreflight};
 use icn_hardware::{CapacityPolicy, HostTopology};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
@@ -83,6 +85,11 @@ enum Command {
         /// Command used to reach Docker, for sites that need a wrapper such as `sudo -n docker`.
         #[arg(long, env = "MAGNITUDE_DOCKER_COMMAND", default_value = "docker")]
         docker_command: String,
+        /// JSON table of servable EIM models. Stage 2 replaces this with the generated catalog
+        /// and its geometry overlay; until that overlay exists, supplying the table as data
+        /// avoids inventing the layer and head counts the RAM estimate depends on.
+        #[arg(long, env = "MAGNITUDE_EIM_CATALOG")]
+        eim_catalog: Option<PathBuf>,
     },
     /// Report whether this host can serve models: Docker reachability and host capacity.
     Doctor {
@@ -137,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
             hf_caches,
             installation,
             docker_command,
+            eim_catalog,
         } => {
             if exit_on_stdin_eof {
                 install_parent_stdin_guard();
@@ -164,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
                 "host topology observed"
             );
 
+            let mut controller = None;
             let mut state = if fake {
                 AppState::new(FakeBackend::new("icn-fake", "Hello from ICN."))
             } else {
@@ -175,6 +184,38 @@ async fn main() -> anyhow::Result<()> {
                     storage_driver = %preflight.storage_driver,
                     "docker daemon ready"
                 );
+
+                let definitions = match &eim_catalog {
+                    Some(path) => EimModelDefinition::load_table(path)
+                        .map_err(|error| anyhow::anyhow!(error))?,
+                    None => Vec::new(),
+                };
+                tracing::info!(
+                    servable_models = definitions.len(),
+                    catalog = ?eim_catalog,
+                    "EIM model table loaded"
+                );
+
+                let eim = Arc::new(EimModelInstanceController::new(
+                    docker,
+                    definitions,
+                    EimControllerConfig {
+                        icn_instance_id: instance_id.clone(),
+                        host_cache_path: cache_root
+                            .clone()
+                            .unwrap_or_else(|| PathBuf::from("/var/lib/magnitude/eim"))
+                            .join("eim/model-cache"),
+                        proxy: ProxySettings::from_environment(),
+                        ..EimControllerConfig::default()
+                    },
+                    tokio::runtime::Handle::current(),
+                ));
+                // Before serving, remove containers a killed predecessor left holding memory.
+                let reaped = eim.reap_orphans().await;
+                if !reaped.is_empty() {
+                    tracing::info!(?reaped, "removed orphaned containers");
+                }
+                controller = Some(eim);
                 AppState::model_free()
             }
             .with_hardware(Arc::new(EimHardware {
@@ -188,6 +229,9 @@ async fn main() -> anyhow::Result<()> {
                 native_build: eim_build.clone(),
             });
 
+            if let Some(controller) = controller {
+                state = state.with_model_controller(controller);
+            }
             if let Some(auth_token) = auth_token {
                 state = state.with_authorization(auth_token);
             }

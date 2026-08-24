@@ -8,6 +8,8 @@
 //!
 //! Module map:
 //!   - `backend`  — CompletionBackend over the container's chat-completions endpoint
+//!   - `controller` — ModelInstanceController: one resident container, load/stop/lease
+//!   - `env_contract` — the INFERENCE_* launch contract, including the tool-call parser
 //!   - `docker`  — the container driver: `docker` CLI invocations, never scraping human output
 //!   - `estimate` — model fit from catalog geometry, replacing the native `common/fit` planner
 //!   - `memory`   — live system-memory sampling and the admission/eviction thresholds
@@ -17,7 +19,9 @@
 //!   - `sse`      — server-sent event framing and OpenAI chat-chunk decoding
 
 pub mod backend;
+pub mod controller;
 pub mod docker;
+pub mod env_contract;
 pub mod estimate;
 pub mod memory;
 pub mod properties;

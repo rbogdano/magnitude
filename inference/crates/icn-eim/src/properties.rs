@@ -24,10 +24,13 @@ use sha2::{Digest, Sha256};
 pub const SERVER_SIDE_TEMPLATE: &str = "eim-vllm-server-side";
 
 /// Reasoning support as declared by the catalog overlay.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReasoningDeclaration {
     /// Effort names in ascending order. Empty when the model does not reason.
+    #[serde(default)]
     pub efforts: Vec<String>,
+    #[serde(default)]
     pub default_effort: Option<String>,
 }
 

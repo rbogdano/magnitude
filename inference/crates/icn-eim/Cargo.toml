@@ -19,6 +19,8 @@ sha2.workspace = true
 sysinfo = { workspace = true, features = ["system"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "process", "time"] }
+libc.workspace = true
+tokio-stream = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 
 [dev-dependencies]

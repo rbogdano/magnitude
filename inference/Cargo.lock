@@ -719,6 +719,7 @@ dependencies = [
  "icn-api",
  "icn-contracts",
  "icn-hardware",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
@@ -726,6 +727,7 @@ dependencies = [
  "sysinfo",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tracing",
 ]
 
@@ -2023,6 +2025,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

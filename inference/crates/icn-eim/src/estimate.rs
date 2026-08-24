@@ -40,7 +40,8 @@ pub const MAX_DYNAMIC_PARALLEL_SEQUENCES: u32 = 4;
 /// `total_parameters` is what the host must hold: for a mixture of experts every expert stays
 /// resident even though only a few are active per token. `active_parameters` is what memory
 /// bandwidth must stream per token, so it drives throughput, not capacity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelGeometry {
     pub total_parameters: u64,
     pub active_parameters: u64,
@@ -48,7 +49,9 @@ pub struct ModelGeometry {
     pub num_key_value_heads: u32,
     pub head_dim: u32,
     pub max_position_embeddings: u32,
+    #[serde(default)]
     pub sliding_window: Option<u32>,
+    #[serde(default)]
     pub vision: bool,
 }
 
