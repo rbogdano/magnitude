@@ -112,6 +112,51 @@ impl EimCatalog {
         }
     }
 
+    /// Plain-language notes about a model, shown beside it.
+    ///
+    /// This is where an unusable model explains itself. Marking one unavailable without saying
+    /// why leaves the user to guess, and for a container-backed catalog most of the reasons are
+    /// specific and actionable: a missing credential, an engine that cannot parse the model's
+    /// tool calls, or a model with no chat template at all.
+    fn quality_evidence(definition: &EimModelDefinition) -> Vec<String> {
+        let mut evidence = Vec::new();
+
+        if definition.tool_call_parser.is_none() {
+            evidence.push(
+                "The engine has no tool-call parser for this model family, so the agent cannot \
+                 use it. It can still hold a conversation."
+                    .to_owned(),
+            );
+        }
+        if definition.hf_token_required {
+            evidence.push(
+                "Gated repository: set HF_TOKEN to download it, and accept the model's licence \
+                 on Hugging Face first."
+                    .to_owned(),
+            );
+        }
+        if definition.geometry.active_parameters < definition.geometry.total_parameters {
+            evidence.push(format!(
+                "Mixture of experts: {:.0}B parameters resident, {:.1}B active per token, so it \
+                 runs closer to the speed of the smaller number.",
+                definition.geometry.total_parameters as f64 / 1e9,
+                definition.geometry.active_parameters as f64 / 1e9,
+            ));
+        }
+        if definition.context_tokens < definition.geometry.max_position_embeddings {
+            evidence.push(format!(
+                "Served at {} tokens of context rather than its trained {}, because the key-value \
+                 cache is sized from this and the engine can refuse to start when it does not fit.",
+                definition.context_tokens, definition.geometry.max_position_embeddings,
+            ));
+        }
+        evidence.push(format!(
+            "Served by vLLM on Intel Xeon through an EIM container, profile {}.",
+            definition.eim_profile_id
+        ));
+        evidence
+    }
+
     fn parameterization(definition: &EimModelDefinition) -> ModelParameterization {
         let total = definition.geometry.total_parameters;
         let active = definition.geometry.active_parameters;
@@ -178,7 +223,7 @@ impl EimCatalog {
             // constant is the honest value. It makes the term drop out of the client's ranking.
             fidelity_rank: 100,
             quantization_aware: false,
-            quality_evidence: Vec::new(),
+            quality_evidence: Self::quality_evidence(definition),
             local_state: if installed {
                 // Reported as up to date: the image digest is the version, so a present image is
                 // by definition the version the table asked for.
@@ -334,6 +379,86 @@ mod tests {
         .await
         .expect("a catalog");
         assert!(!without.catalog_models[0].capabilities.tools);
+    }
+
+    #[tokio::test]
+    async fn a_model_without_a_parser_says_why_it_cannot_be_used() {
+        let response = catalog(vec![EimModelDefinition {
+            tool_call_parser: None,
+            ..definition()
+        }])
+        .list()
+        .await
+        .expect("a catalog");
+        let evidence = &response.catalog_models[0].quality_evidence;
+
+        assert!(
+            evidence
+                .iter()
+                .any(|note| note.contains("tool-call parser")),
+            "{evidence:?}"
+        );
+        // And that it is a capability limit, not a malfunction.
+        assert!(
+            evidence
+                .iter()
+                .any(|note| note.contains("hold a conversation")),
+            "{evidence:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gated_model_names_the_credential_it_needs() {
+        let response = catalog(vec![EimModelDefinition {
+            hf_token_required: true,
+            ..definition()
+        }])
+        .list()
+        .await
+        .expect("a catalog");
+
+        assert!(
+            response.catalog_models[0]
+                .quality_evidence
+                .iter()
+                .any(|note| note.contains("HF_TOKEN")),
+            "{:?}",
+            response.catalog_models[0].quality_evidence
+        );
+    }
+
+    #[tokio::test]
+    async fn explains_a_context_shorter_than_the_model_was_trained_for() {
+        // Otherwise a user comparing the served context against the model card sees a
+        // discrepancy with no explanation.
+        let response = catalog(vec![definition()]).list().await.expect("a catalog");
+
+        assert!(
+            response.catalog_models[0]
+                .quality_evidence
+                .iter()
+                .any(|note| note.contains("32768") && note.contains("40960")),
+            "{:?}",
+            response.catalog_models[0].quality_evidence
+        );
+    }
+
+    #[tokio::test]
+    async fn a_serveable_model_still_says_how_it_is_served() {
+        let response = catalog(vec![definition()]).list().await.expect("a catalog");
+        let evidence = &response.catalog_models[0].quality_evidence;
+
+        assert!(
+            evidence.iter().any(|note| note.contains("EIM container")),
+            "{evidence:?}"
+        );
+        // No complaint about tools or a credential, because neither applies.
+        assert!(
+            !evidence
+                .iter()
+                .any(|note| note.contains("tool-call parser"))
+        );
+        assert!(!evidence.iter().any(|note| note.contains("HF_TOKEN")));
     }
 
     #[tokio::test]

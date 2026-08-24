@@ -1080,6 +1080,16 @@ const ReadyModelsMenu = memo(function ReadyModelsMenu({
               {detailLocalModel.catalogMembershipState._tag === "InCatalog" && detailLocalModel.catalogMembershipState.catalogData.quantizationAware && (
                 <text style={{ fg: theme.text.metadata }}>Training: Quantization-aware</text>
               )}
+              {/*
+                Notes explaining the model, and above all why it may be unusable here. Without
+                them a model marked unavailable gives the user nothing to act on: a missing
+                credential, an engine that cannot parse its tool calls, and a served context
+                shorter than the model card claims all look identical otherwise.
+              */}
+              {detailLocalModel.catalogMembershipState._tag === "InCatalog"
+                && detailLocalModel.catalogMembershipState.catalogData.qualityNotes.map((note) => (
+                  <text key={note} style={{ fg: theme.text.supporting }}>{`· ${note}`}</text>
+                ))}
             </>
           )}
           {detailIsLocal && Option.exists(detailMemory, ({ currentHeadroomState, systemUseState }) =>
