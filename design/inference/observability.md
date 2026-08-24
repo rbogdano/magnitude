@@ -2,10 +2,9 @@
 applies_to:
   - inference/crates/icn-server/src/telemetry.rs
   - inference/crates/icn-server/src/main.rs
-  - inference/crates/icn-server/src/inference_worker.rs
-  - inference/crates/icn-server/src/memory_supervisor.rs
+  - inference/crates/icn-eim/src/memory.rs
   - inference/crates/icn-api/src/lib.rs
-  - inference/crates/icn-engine/src/**
+  - inference/crates/icn-eim/src/**
 ---
 
 # ICN observability

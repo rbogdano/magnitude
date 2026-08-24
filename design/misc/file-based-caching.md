@@ -6,7 +6,6 @@ applies_to:
   - inference/crates/icn-models/**
   - inference/crates/icn-hardware/**
   - inference/crates/icn-utils/**
-  - inference/crates/icn-server/src/load_progress.rs
   - inference/catalog/**
   - packages/icn/src/lifecycle/**
   - packages/acn/src/icn/layer.ts

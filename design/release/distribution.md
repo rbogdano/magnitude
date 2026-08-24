@@ -25,9 +25,9 @@ Published hosts are Apple arm64, Apple x64, Linux GNU arm64, and Linux GNU x64. 
 are not published. Each backend pack names exactly one required ICN base and must have the same
 native-build identity and backend-module ABI as that base.
 
-Apple arm64 publishes Metal. Linux arm64 and x64 publish Vulkan plus CUDA 11.8 and CUDA 12.9.
-CUDA device-image and driver compatibility is defined by
-[CUDA compatibility](../inference/cuda-compatibility.md).
+There is one release artifact and no accelerator packs. Inference runs in an EIM container, so what
+the engine can use is a property of the serving image and of the host's Docker daemon, discovered at
+startup rather than selected at publish time. See [the EIM container backend](../icn/eim-containers.md).
 
 ## Release identity
 

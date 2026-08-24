@@ -14,7 +14,7 @@ applies_to:
 # ICN provider contract
 
 ICN implements Magnitude's `local` AI provider. Generic provider and agent code sees an ordinary
-provider model ID and `BoundModel`; it does not see packages, downloads, assessments, native plans,
+provider model ID and `BoundModel`; it does not see packages, downloads, assessments, serving plans,
 or runtime residency.
 
 ## Provider offerings
@@ -47,11 +47,11 @@ Provider catalog presentation keeps the base display name and optional variant l
 fields. The local adapter derives both through the same ACN resolver used by the local-model product
 projection; generic provider and agent code treat the label as presentation only.
 
-Initial and invalidation-driven projection runs in one scoped background worker. Native assessment
+Initial and invalidation-driven projection runs in one scoped background task. ICN-side assessment
 never gates ACN service readiness.
 
 The local-offering projection consumes the shared per-configuration assessment state; it never
-invokes native assessment. Package notifications may change offering availability, while the
+invokes assessment. Package notifications may change offering availability, while the
 separate local-model assessor decides assessment admission from semantic assessment keys.
 Download progress may update product acquisition presentation but cannot transition an offering's
 configuration to `Assessing`.
@@ -108,7 +108,7 @@ preparation use the same canonical slot and instance observation:
 1. resolve the selected configuration through its current provider offering;
 2. require all bundle packages to be installed;
 3. create a fresh `ModelInstanceId` and submit the exact configuration to ICN;
-4. bind the slot after native admission and observe that exact instance to Ready; and
+4. bind the slot after admission and observe that exact instance to Ready; and
 5. start chat with that exact instance ID and configuration.
 
 The submitted configuration fixes per-request context capacity. ICN independently resolves the
@@ -126,7 +126,7 @@ not resident fails without mutating runtime state.
 
 ## Concurrency and lifetime
 
-The ICN `ModelInstanceController` is the sole native mutation and lease authority.
+The ICN `ModelInstanceController` is the sole mutation and lease authority.
 
 - Load, Stop, and replacement mutations serialize.
 - Equivalent instance admissions are idempotent; caller interruption never cancels admitted work.
@@ -135,8 +135,8 @@ The ICN `ModelInstanceController` is the sole native mutation and lease authorit
 - Replacement closes new admission and waits for existing generation leases.
 - A completion holds one generation lease until its body completes, fails, or is canceled.
 - A failed mutation does not poison later attempts.
-- Unexpected resident-worker loss is observed with the configuration identity and becomes a typed
-  blocked slot state; it is not inferred from generic provider unavailability.
+- Unexpected loss of the resident serving container is observed with the configuration identity and
+  becomes a typed blocked slot state; it is not inferred from generic provider unavailability.
 
 ACN rechecks the attributed slot and exact instance after preparation. Progress and terminal state
 come from `ModelInstancesSnapshot`; the load response stream is never the lifecycle authority.
@@ -166,7 +166,7 @@ response stream clears provider-owned progress. Providers that do not support gr
 remain valid and expose no synthetic progress.
 
 ICN also publishes one final cumulative timing snapshot for every accepted generation. The local
-provider translates its generated-token count, decode duration, native decode rate, and time to
+provider translates its generated-token count, decode duration, decode rate, and time to
 first token into the optional provider-neutral generation-performance contract. This final
 measurement is independent of transient request progress and requires no per-token timing stream.
 Generic agent code consumes the optional capability without branching on the local provider ID.
@@ -177,9 +177,10 @@ A speculative-decoding bundle is explicit in the offering's configuration, inclu
 and embedded or separate draft source. ACN does not attach, remove, or infer a draft or method
 during provider resolution or chat.
 
-ICN resolves embedded and separate draft capability through one native planning path. Assessment
-and loading use the same exact bundle structure and speculative-selection policy. Runtime evidence
-reports the selected method, effective parameters, and whether drafting actually ran.
+Speculative decoding is unavailable and says so rather than reporting a disabled configuration that
+was never considered: no EIM serving profile declares any speculative argument. A servable bundle is
+therefore always a single package, and the draft-source and method contract types remain in the
+protocol for stability while being unreachable.
 
 ## Failure behavior
 

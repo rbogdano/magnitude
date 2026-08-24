@@ -13,8 +13,9 @@ applies_to:
 
 # Model assessment and recommendation
 
-Terms follow [Model-management terminology](./terminology.md). Native mechanics follow
-[Hardware calibration and model assessment](../icn/calibration-model-assessment.md).
+Terms follow [Model-management terminology](./terminology.md). How fit is estimated and what the
+engine's own memory reservation is follow [the EIM container backend](../icn/eim-containers.md) and
+[ICN model fit assessment](../../info/inference/fit-estimation.md).
 
 ## Ownership
 

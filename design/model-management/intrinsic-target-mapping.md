@@ -1,7 +1,7 @@
 ---
 applies_to:
   - inference/catalog/**
-  - inference/crates/icn-catalog/**
+  - inference/eim/models.json
   - inference/crates/icn-models/**
   - inference/crates/icn-contracts/src/models.rs
   - packages/icn/src/catalog/**

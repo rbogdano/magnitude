@@ -8,7 +8,7 @@ applies_to:
   - packages/release/scripts/matrix.ts
   - packages/release/scripts/validate-host.ts
   - packages/release/src/targets.ts
-  - inference/scripts/compile.ts
+  - inference/scripts/build-local.ts
 ---
 
 # Release build and validation

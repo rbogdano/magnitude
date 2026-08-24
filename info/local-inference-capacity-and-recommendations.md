@@ -1,53 +1,74 @@
 # Local inference capacity and recommendations
 
-ICN is the only authority for inference hardware, artifact inspection, model fit, model storage,
-downloads, and active runtime state. CLI and web actions call ACN RPCs; ACN translates those actions
-to the generated ICN client. ACN never treats its own host as the inference machine.
+ICN is the only authority for inference hardware, model fit, the model catalog, and active runtime
+state. CLI and web actions call ACN RPCs; ACN translates those actions to the generated ICN client.
+ACN never treats its own host as the inference machine.
 
-The curated model recipes are Magnitude-owned metadata. They group quantized choices under
-stable checkpoint identities and record repositories, artifact selectors, exact product context
-profiles, required companion paths and roles, reviewed performance and fidelity evidence, and
-license policy. It does not pin Hugging Face commits or copy resolved shard lists, sizes, or hashes
-into source.
+Inference runs in an Intel EIM container, not in ICN's address space. ICN starts and stops that
+container and speaks HTTP to it over loopback. Clients still never talk to the container: ICN remains
+the only route, and there is no alternate transport or externally supplied endpoint.
 
-ICN queries Hugging Face, resolves `main` to an immutable snapshot, and returns current files,
-sizes, identities, license data, and commit provenance. Preview and download then use that exact
-commit. ICN derives GGUF architecture, parameter counts, quantization, maximum context, placement,
-memory, and generation speed from artifact metadata. Arbitrary GGUF repositories use the same
-resolution and preview path but have no curated Magnitude quality or fidelity claims.
+## The catalog
 
-Live discovery is cached by ICN: search results are brief, repository snapshots have a short TTL,
-and GGUF headers plus fit/performance assessments are content-addressed by immutable artifact and
-hardware evidence. No model weights are downloaded until the user chooses a model.
+The catalog is Magnitude-owned metadata over the models EIM ships. For each one it records the
+Hugging Face repository, the EIM serving profile to pin, the served context, geometry, curated
+quality evidence, licence, and which vLLM parsers the model needs for tool calls and reasoning.
 
-For each usage choice the ICN recipe service submits the applicable context and parallel-sequence
-profiles to preview. Catalog models use their one reviewed context configuration. Discovered local
-models use one 100K context configuration bounded by the model's native maximum. The selected
-configuration is used consistently for fit, catalog availability, recommendations, and loading.
-Each configuration carries speed estimates at 25K, 50K, 75K, and full context, with points above
-its configured context omitted. Recommendations require at least 5 expected tokens per second at
-full context, and Balanced speed utility uses 5 tokens per second as its zero point. Ranking and
-relative speed comparisons use the 50K estimate, bounded by the configured context. The UI shows
-the expected-speed range between the bounded 25K and 75K points.
-The service ranks
-eligible candidates into material Balanced, Smartest, Fastest, and Lightweight intents using
-common Terminal-Bench v2.1 capability, estimated generation speed, runtime memory, quantization
-fidelity, and download size. Multiple quantizations of one checkpoint may appear when they explain
-a real quality trade-off; duplicate filler cards are omitted. Lightweight chooses the most capable
-usable configuration in a low-memory tier derived from the configuration's stable post-reserve
-physical memory domains, and is omitted when no distinct configuration is materially lighter than
-Balanced. The UI always presents these intents as
-Balanced, Smartest, Fastest, then Lightweight, and explains each specialized option by comparing
-its capability, speed, context, footprint, and possible quality loss with Balanced. The UI continues
-to show recommendations, exact artifact details, hardware, download progress, downloaded models,
-activation, restart, unload, and deletion. Download and load progress update the ICN inventory
-snapshot, which ACN exposes through the ordinary mirrored-state contract.
+Geometry and weight sizes are fetched from Hugging Face rather than asserted, because the memory
+estimate depends on them. Quality scores are curated estimates and their provenance says so: no
+benchmark is run here, and reporting an estimate as a measurement would be a fabrication.
 
-Downloaded artifacts live in ICN's configured model store. `GET /v1/models` is the inventory and
-residency authority, while `GET /v1/hardware` is the hardware and live memory authority. ACN persists
-only user usage/profile and ordinary slot selections; it does not
-persist a competing artifact index, endpoint binding, runtime installation, or active-model record.
+Every catalog model is listed whether or not this host can serve it. A model that does not fit, is
+gated without a credential, or has no tool-call parser stays visible with a machine-readable reason
+and a plain-language note. The onboarding chooser is the deliberate exception — it is a guided
+first-run flow and offers only models that can actually be served.
 
-The local provider ID is `local`. Its model catalog is projected from ICN inventory, demand loading
-uses ICN runtime control, and generation streams through ICN chat. There is no external local-server
-route or alternate model transport.
+Served context is often below a model's trained maximum. The key-value cache is sized from it, and on
+the CPU backend the engine can refuse to start when that cache does not fit, so the catalog says why
+whenever the two differ.
+
+## Capacity
+
+`GET /v1/hardware` is the hardware and live-memory authority. It reports one system memory domain
+holding one CPU device: a container-backed engine exposes no devices to ICN, and inventing them would
+put fiction into the topology that assessments are validated against.
+
+Host NUMA node count is load-bearing rather than cosmetic. EIM's profile selector rejects a
+tensor-parallel size above it, so it decides which serving profiles are usable at all, and
+`magnitude-icn doctor` reports the maximum.
+
+Fit is estimated from catalog geometry rather than measured, and is separate from the memory
+reservation the engine itself honors. See `info/inference/fit-estimation.md`.
+
+## Recommendations
+
+Ranking uses curated capability, an estimated generation speed, and runtime memory. Two of those
+inputs behave differently than they did with a local GGUF inventory.
+
+Speed starts as a memory-bandwidth roofline over active parameters, since decode on a CPU host is
+bandwidth-bound. That makes a mixture of experts rank far above a dense model of the same weight, and
+it is an estimate until real throughput has been observed for that model on that host.
+
+Quantization fidelity no longer discriminates. Every EIM serving profile is bf16, so the fidelity term
+is constant across candidates and drops out of the ranking. `Smartest` therefore resolves toward
+capability, which for an all-bf16 catalog is the correct reading rather than a degradation.
+
+## Residency
+
+At most one model is resident at a time. Loading terminalizes the previous instance before the
+replacement becomes Ready, because the memory estimate is reasoned against the whole host budget and
+two resident models would silently double what that budget assumed.
+
+The client sets an idle timeout — longer while connected, shorter after it disconnects — and ICN
+enforces it by releasing the container. ACN persists only user profile and ordinary slot selections;
+it keeps no competing artifact index, endpoint binding, or active-model record.
+
+The local provider ID is `local`. Its catalog is projected from what ICN reports, demand loading uses
+ICN runtime control, and generation streams through ICN chat.
+
+## Weights
+
+Weights are not managed by Magnitude yet. A model absent from the mounted cache is downloaded by the
+engine inside the container, which means a fresh container downloads it again — accepted for now, and
+the reason installing a model through the catalog is refused explicitly rather than admitted and left
+to stall.
