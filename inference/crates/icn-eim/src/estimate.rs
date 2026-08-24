@@ -44,6 +44,14 @@ pub const MAX_DYNAMIC_PARALLEL_SEQUENCES: u32 = 4;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ModelGeometry {
     pub total_parameters: u64,
+    /// Measured on-disk weight bytes, when known.
+    ///
+    /// Preferred over `total_parameters * 2` because a published checkpoint is not always bf16.
+    /// `openai/gpt-oss-20b` ships in MXFP4 and weighs 13.8 GB, which the parameter count would
+    /// have overestimated threefold -- and it is the resident bytes, not the parameter count,
+    /// that decide whether a model fits.
+    #[serde(default)]
+    pub weight_bytes: Option<u64>,
     pub active_parameters: u64,
     pub num_hidden_layers: u32,
     pub num_key_value_heads: u32,
@@ -92,9 +100,11 @@ pub struct MemoryEstimate {
 impl MemoryEstimate {
     #[must_use]
     pub fn compute(geometry: &ModelGeometry, shape: &ServingShape) -> Self {
-        let weight_bytes = geometry
-            .total_parameters
-            .saturating_mul(BF16_BYTES_PER_PARAMETER);
+        let weight_bytes = geometry.weight_bytes.unwrap_or_else(|| {
+            geometry
+                .total_parameters
+                .saturating_mul(BF16_BYTES_PER_PARAMETER)
+        });
 
         let kv_bytes = geometry
             .kv_bytes_per_token()
@@ -346,6 +356,7 @@ mod tests {
     fn qwen3_30b_a3b() -> ModelGeometry {
         ModelGeometry {
             total_parameters: 30_500_000_000,
+            weight_bytes: None,
             active_parameters: 3_300_000_000,
             num_hidden_layers: 48,
             num_key_value_heads: 4,
@@ -359,6 +370,7 @@ mod tests {
     fn llama4_scout() -> ModelGeometry {
         ModelGeometry {
             total_parameters: 109_000_000_000,
+            weight_bytes: None,
             active_parameters: 17_000_000_000,
             num_hidden_layers: 48,
             num_key_value_heads: 8,
@@ -437,6 +449,7 @@ mod tests {
     fn never_asks_for_a_sliver() {
         let tiny = ModelGeometry {
             total_parameters: 100_000_000,
+            weight_bytes: None,
             active_parameters: 100_000_000,
             ..qwen3_8b()
         };
@@ -462,6 +475,7 @@ mod tests {
     fn qwen3_8b() -> ModelGeometry {
         ModelGeometry {
             total_parameters: 8_200_000_000,
+            weight_bytes: None,
             active_parameters: 8_200_000_000,
             num_hidden_layers: 36,
             num_key_value_heads: 8,
@@ -482,6 +496,37 @@ mod tests {
                 + estimate.kv_bytes
                 + estimate.activation_bytes
                 + estimate.runtime_bytes,
+        );
+    }
+
+    #[test]
+    fn prefers_measured_weight_bytes_over_the_parameter_count() {
+        // gpt-oss-20b ships in MXFP4: 13.8 GB on disk for ~21 billion parameters, which
+        // `parameters * 2` would have called 42 GB. Resident bytes are what decide fit.
+        let measured = ModelGeometry {
+            total_parameters: 21_000_000_000,
+            active_parameters: 3_600_000_000,
+            weight_bytes: Some(13_800_000_000),
+            num_hidden_layers: 24,
+            num_key_value_heads: 8,
+            head_dim: 64,
+            max_position_embeddings: 131_072,
+            sliding_window: Some(128),
+            vision: false,
+        };
+
+        assert_eq!(
+            MemoryEstimate::compute(&measured, &shape(32_768, 1)).weight_bytes,
+            13_800_000_000
+        );
+        // Without a measurement the bf16 assumption still applies.
+        let derived = ModelGeometry {
+            weight_bytes: None,
+            ..measured
+        };
+        assert_eq!(
+            MemoryEstimate::compute(&derived, &shape(32_768, 1)).weight_bytes,
+            42_000_000_000
         );
     }
 
@@ -595,6 +640,7 @@ mod tests {
         // A model whose weights fit easily but whose full-context KV cache does not.
         let geometry = ModelGeometry {
             total_parameters: 8_000_000_000,
+            weight_bytes: None,
             active_parameters: 8_000_000_000,
             num_hidden_layers: 64,
             num_key_value_heads: 64,

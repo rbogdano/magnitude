@@ -272,6 +272,7 @@ mod tests {
             context_tokens: 32_768,
             geometry: ModelGeometry {
                 total_parameters: 8_200_000_000,
+                weight_bytes: None,
                 active_parameters: 8_200_000_000,
                 num_hidden_layers: 36,
                 num_key_value_heads: 8,
@@ -346,6 +347,7 @@ mod tests {
         let moe = catalog(vec![EimModelDefinition {
             geometry: ModelGeometry {
                 total_parameters: 30_500_000_000,
+                weight_bytes: None,
                 active_parameters: 3_300_000_000,
                 ..definition().geometry
             },

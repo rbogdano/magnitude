@@ -92,6 +92,7 @@ mod tests {
             context_tokens: 32_768,
             geometry: ModelGeometry {
                 total_parameters: 8_200_000_000,
+                weight_bytes: None,
                 active_parameters: 8_200_000_000,
                 num_hidden_layers: 36,
                 num_key_value_heads: 8,

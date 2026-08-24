@@ -58,6 +58,7 @@ fn definition(image: &str) -> EimModelDefinition {
         context_tokens: 8_192,
         geometry: ModelGeometry {
             total_parameters: 1_000_000_000,
+            weight_bytes: None,
             active_parameters: 1_000_000_000,
             num_hidden_layers: 16,
             num_key_value_heads: 4,
