@@ -11,7 +11,7 @@ use serde::Deserialize;
 use tokio::process::Command;
 
 use super::inspect::{ContainerState, ImageSummary};
-use super::naming::{OwnedContainer, ICN_INSTANCE_LABEL, OWNER_LABEL, OWNER_VALUE, PID_LABEL};
+use super::naming::{ICN_INSTANCE_LABEL, OWNER_LABEL, OWNER_VALUE, OwnedContainer, PID_LABEL};
 
 /// One completed `docker` process, kept for diagnostics.
 #[derive(Clone, Debug)]
@@ -307,7 +307,13 @@ impl DockerCli {
             // A client-only failure here means the daemon is down or unreachable, which is the
             // one startup condition the client UI must be able to explain.
             return Err(DockerError::DaemonUnreachable(
-                version.stderr.trim().lines().next().unwrap_or("").to_owned(),
+                version
+                    .stderr
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_owned(),
             ));
         }
         let parsed: RawVersion =
@@ -345,10 +351,7 @@ impl DockerCli {
     }
 
     /// Reads `.State`. Returns `None` when the container no longer exists.
-    pub async fn container_state(
-        &self,
-        name: &str,
-    ) -> Result<Option<ContainerState>, DockerError> {
+    pub async fn container_state(&self, name: &str) -> Result<Option<ContainerState>, DockerError> {
         let invocation = self
             .invoke(&[
                 "inspect".to_owned(),
@@ -455,7 +458,11 @@ impl DockerCli {
             .await?;
 
         let mut owned = Vec::new();
-        for line in invocation.stdout.lines().filter(|line| !line.trim().is_empty()) {
+        for line in invocation
+            .stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+        {
             #[derive(Deserialize)]
             struct RawPs {
                 #[serde(rename = "ID", default)]
@@ -533,7 +540,11 @@ mod tests {
     #[test]
     fn keeps_the_container_port_at_8000() {
         // The base image's HEALTHCHECK hardcodes localhost:8000.
-        assert!(spec().to_run_args().contains(&"127.0.0.1:43117:8000".to_owned()));
+        assert!(
+            spec()
+                .to_run_args()
+                .contains(&"127.0.0.1:43117:8000".to_owned())
+        );
     }
 
     #[test]
@@ -541,7 +552,10 @@ mod tests {
         let args = spec().to_run_args();
         let limit = 83_000_000_000_u64.to_string();
 
-        let memory = args.iter().position(|arg| arg == "--memory").expect("limit");
+        let memory = args
+            .iter()
+            .position(|arg| arg == "--memory")
+            .expect("limit");
         let swap = args
             .iter()
             .position(|arg| arg == "--memory-swap")
@@ -578,7 +592,10 @@ mod tests {
     fn puts_the_image_last_so_no_flag_is_mistaken_for_it() {
         let args = spec().to_run_args();
 
-        assert_eq!(args.last().map(String::as_str), Some("magnitude-eim-xeon-qwen-qwen3-8b:v1"));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("magnitude-eim-xeon-qwen-qwen3-8b:v1")
+        );
         assert_eq!(args.first().map(String::as_str), Some("run"));
     }
 

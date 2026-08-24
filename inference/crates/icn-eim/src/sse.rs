@@ -183,9 +183,7 @@ fn decode_reasoning_details(details: Option<&Value>) -> Option<String> {
     let text = details?
         .as_array()?
         .iter()
-        .filter(|detail| {
-            detail.get("type").and_then(Value::as_str) == Some("reasoning.text")
-        })
+        .filter(|detail| detail.get("type").and_then(Value::as_str) == Some("reasoning.text"))
         .filter_map(|detail| non_empty_text(detail.get("text")))
         .collect::<String>();
     (!text.is_empty()).then_some(text)
@@ -252,10 +250,13 @@ pub struct ToolCallAccumulator {
 
 impl ToolCallAccumulator {
     pub fn absorb(&mut self, delta: &ToolCallDelta) {
-        let call = self.calls.entry(delta.index).or_insert_with(|| ToolCallDelta {
-            index: delta.index,
-            ..ToolCallDelta::default()
-        });
+        let call = self
+            .calls
+            .entry(delta.index)
+            .or_insert_with(|| ToolCallDelta {
+                index: delta.index,
+                ..ToolCallDelta::default()
+            });
         if let Some(id) = &delta.id {
             call.id = Some(id.clone());
         }
@@ -430,7 +431,11 @@ mod tests {
         );
 
         let mut accumulator = ToolCallAccumulator::default();
-        for delta in opening.tool_calls.iter().chain(continuation.tool_calls.iter()) {
+        for delta in opening
+            .tool_calls
+            .iter()
+            .chain(continuation.tool_calls.iter())
+        {
             accumulator.absorb(delta);
         }
         let calls = accumulator.finish();
@@ -446,8 +451,18 @@ mod tests {
         let mut accumulator = ToolCallAccumulator::default();
         // Deliberately absorb the second call first; output must still be index-ordered.
         for delta in [
-            ToolCallDelta { index: 1, id: Some("b".into()), name: Some("second".into()), arguments: "{}".into() },
-            ToolCallDelta { index: 0, id: Some("a".into()), name: Some("first".into()), arguments: "{}".into() },
+            ToolCallDelta {
+                index: 1,
+                id: Some("b".into()),
+                name: Some("second".into()),
+                arguments: "{}".into(),
+            },
+            ToolCallDelta {
+                index: 0,
+                id: Some("a".into()),
+                name: Some("first".into()),
+                arguments: "{}".into(),
+            },
         ] {
             accumulator.absorb(&delta);
         }
@@ -514,7 +529,10 @@ mod tests {
         assert_eq!(finish_reason(Some("length")), FinishReason::Length);
         assert_eq!(finish_reason(Some("tool_calls")), FinishReason::ToolCalls);
         // Older servers say function_call for the same thing.
-        assert_eq!(finish_reason(Some("function_call")), FinishReason::ToolCalls);
+        assert_eq!(
+            finish_reason(Some("function_call")),
+            FinishReason::ToolCalls
+        );
         // An ended stream with no stated reason is a normal stop, not a failure.
         assert_eq!(finish_reason(None), FinishReason::Stop);
         assert_eq!(finish_reason(Some("something_new")), FinishReason::Stop);

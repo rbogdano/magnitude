@@ -15,7 +15,7 @@ use icn_contracts::{
     ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatRole, ReasoningControl,
     ResponseFormat, ToolChoice,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// Builds the request body vLLM expects.
 ///
@@ -31,10 +31,7 @@ pub fn to_vllm_request(request: &ChatRequest, served_model_name: &str) -> Value 
     body.insert("stream".into(), json!(true));
     // Without this the final chunk carries no token accounting and `Generation` would have to
     // guess its own prompt and completion counts.
-    body.insert(
-        "stream_options".into(),
-        json!({ "include_usage": true }),
-    );
+    body.insert("stream_options".into(), json!({ "include_usage": true }));
     body.insert(
         "messages".into(),
         Value::Array(template.messages.iter().map(to_vllm_message).collect()),
@@ -76,7 +73,10 @@ pub fn to_vllm_request(request: &ChatRequest, served_model_name: &str) -> Value 
                     .collect(),
             ),
         );
-        body.insert("parallel_tool_calls".into(), json!(template.parallel_tool_calls));
+        body.insert(
+            "parallel_tool_calls".into(),
+            json!(template.parallel_tool_calls),
+        );
     }
 
     if let Some(tool_choice) = to_vllm_tool_choice(&template.tool_choice) {
@@ -346,7 +346,9 @@ mod tests {
         let mut chat = template(vec![ChatMessage {
             role: ChatRole::User,
             content: Some(ChatContent::Parts(vec![
-                ChatContentPart::Text { text: "what is this".to_owned() },
+                ChatContentPart::Text {
+                    text: "what is this".to_owned(),
+                },
                 ChatContentPart::Image(ImageInput::new("image/png", vec![1_u8, 2, 3])),
             ])),
             reasoning: None,
@@ -394,7 +396,10 @@ mod tests {
         assert_eq!(turn["reasoning_content"], json!("I should read it"));
         assert_eq!(turn["tool_calls"][0]["id"], json!("call_1"));
         assert_eq!(turn["tool_calls"][0]["type"], json!("function"));
-        assert_eq!(turn["tool_calls"][0]["function"]["name"], json!("read_file"));
+        assert_eq!(
+            turn["tool_calls"][0]["function"]["name"],
+            json!("read_file")
+        );
 
         assert_eq!(body["messages"][1]["role"], json!("tool"));
         assert_eq!(body["messages"][1]["tool_call_id"], json!("call_1"));
@@ -440,7 +445,9 @@ mod tests {
         assert_eq!(choice(ToolChoice::None), Some(json!("none")));
         assert_eq!(choice(ToolChoice::Required), Some(json!("required")));
         assert_eq!(
-            choice(ToolChoice::Function { name: "read_file".to_owned() }),
+            choice(ToolChoice::Function {
+                name: "read_file".to_owned()
+            }),
             Some(json!({ "type": "function", "function": { "name": "read_file" } }))
         );
         // vLLM has no allowed-tools member, so this degrades to the bare mode.
@@ -499,13 +506,18 @@ mod tests {
         chat.reasoning = ReasoningControl::Disabled;
         let body = to_vllm_request(&request(chat), "m");
 
-        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], json!(false));
+        assert_eq!(
+            body["chat_template_kwargs"]["enable_thinking"],
+            json!(false)
+        );
     }
 
     #[test]
     fn enabled_reasoning_switches_it_on_and_ignores_the_budget() {
         let mut chat = template(vec![user("hi")]);
-        chat.reasoning = ReasoningControl::Enabled { budget_tokens: Some(2048) };
+        chat.reasoning = ReasoningControl::Enabled {
+            budget_tokens: Some(2048),
+        };
         let body = to_vllm_request(&request(chat), "m");
 
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], json!(true));

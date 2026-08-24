@@ -9,8 +9,8 @@
 //! boundary was already serializable, which is why swapping stdio for HTTP touches nothing
 //! above this crate.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt as _;
@@ -22,7 +22,7 @@ use icn_contracts::{
 use tokio::runtime::Handle;
 
 use crate::request::to_vllm_request;
-use crate::sse::{decode_chunk, next_sse_frame, sse_data, ChunkOutcome, ToolCallAccumulator};
+use crate::sse::{ChunkOutcome, ToolCallAccumulator, decode_chunk, next_sse_frame, sse_data};
 
 /// How long to wait for the whole response. Generous, because a long agentic turn on CPU can
 /// legitimately run for minutes; the caller cancels through the event callback instead.
@@ -127,9 +127,9 @@ impl StreamState {
     /// on a streaming request that interval *is* prefill plus scheduling, and attributing it
     /// to the prompt is the closest honest reading available.
     fn metrics(&self, dispatched_at: Instant) -> GenerationMetrics {
-        let time_to_first_token_ms = self
-            .first_token_at
-            .map_or(0.0, |at| at.duration_since(dispatched_at).as_secs_f64() * 1000.0);
+        let time_to_first_token_ms = self.first_token_at.map_or(0.0, |at| {
+            at.duration_since(dispatched_at).as_secs_f64() * 1000.0
+        });
         let decode_ms = match (self.first_token_at, self.last_token_at) {
             (Some(first), Some(last)) => last.duration_since(first).as_secs_f64() * 1000.0,
             _ => 0.0,
@@ -204,18 +204,17 @@ impl CompletionBackend for EimCompletionBackend {
         let mut state = StreamState::new();
         let dispatched_at = Instant::now();
 
-        let mut emit = |event: InferenceStreamEvent,
-                        callback_error: &mut Option<InferenceError>|
-         -> bool {
-            match on_event(event) {
-                Ok(()) => true,
-                Err(error) => {
-                    *callback_error = Some(error);
-                    cancelled.store(true, Ordering::Relaxed);
-                    false
+        let mut emit =
+            |event: InferenceStreamEvent, callback_error: &mut Option<InferenceError>| -> bool {
+                match on_event(event) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        *callback_error = Some(error);
+                        cancelled.store(true, Ordering::Relaxed);
+                        false
+                    }
                 }
-            }
-        };
+            };
 
         if !emit(
             InferenceStreamEvent {
@@ -360,7 +359,8 @@ fn absorb(
         state.finish_reason = Some(reason.clone());
     }
 
-    let semantic = chunk.content.is_some() || chunk.reasoning.is_some() || !chunk.tool_calls.is_empty();
+    let semantic =
+        chunk.content.is_some() || chunk.reasoning.is_some() || !chunk.tool_calls.is_empty();
     if semantic {
         let now = Instant::now();
         if state.first_token_at.is_none() {
@@ -460,7 +460,10 @@ mod tests {
     use super::*;
     use crate::sse::{ChatChunk, ToolCallDelta, UsageDelta};
 
-    fn collect(chunks: &[ChatChunk], timings_per_token: bool) -> (StreamState, Vec<InferenceEvent>) {
+    fn collect(
+        chunks: &[ChatChunk],
+        timings_per_token: bool,
+    ) -> (StreamState, Vec<InferenceEvent>) {
         let mut state = StreamState::new();
         let dispatched_at = Instant::now();
         let mut events = Vec::new();
@@ -524,9 +527,11 @@ mod tests {
 
         assert_eq!(state.reasoning, "thinking");
         assert_eq!(state.text, "answer");
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, InferenceEvent::ReasoningDelta { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, InferenceEvent::ReasoningDelta { .. }))
+        );
     }
 
     #[test]
@@ -577,9 +582,11 @@ mod tests {
 
     #[test]
     fn attaches_timings_only_when_requested() {
-        assert!(absorb_once(false)
-            .iter()
-            .all(|event| event.timings.is_none()));
+        assert!(
+            absorb_once(false)
+                .iter()
+                .all(|event| event.timings.is_none())
+        );
 
         let requested = absorb_once(true);
         let content_deltas = requested
@@ -589,10 +596,12 @@ mod tests {
         assert!(!content_deltas.is_empty());
         assert!(content_deltas.iter().all(|event| event.timings.is_some()));
         // StreamStart and progress markers carry no per-token snapshot.
-        assert!(requested
-            .iter()
-            .filter(|event| matches!(event.delta, InferenceEvent::StreamStart))
-            .all(|event| event.timings.is_none()));
+        assert!(
+            requested
+                .iter()
+                .filter(|event| matches!(event.delta, InferenceEvent::StreamStart))
+                .all(|event| event.timings.is_none())
+        );
     }
 
     #[test]
@@ -600,7 +609,12 @@ mod tests {
         let mut state = StreamState::new();
         state.generated_tokens = 3;
 
-        assert_eq!(state.snapshot(state.metrics(Instant::now())).generated_tokens, 3);
+        assert_eq!(
+            state
+                .snapshot(state.metrics(Instant::now()))
+                .generated_tokens,
+            3
+        );
     }
 
     #[test]
@@ -641,7 +655,11 @@ mod tests {
     #[test]
     fn a_usage_only_chunk_starts_no_assistant_turn() {
         let usage = ChatChunk {
-            usage: Some(UsageDelta { prompt_tokens: 5, completion_tokens: 0, cached_prompt_tokens: 0 }),
+            usage: Some(UsageDelta {
+                prompt_tokens: 5,
+                completion_tokens: 0,
+                cached_prompt_tokens: 0,
+            }),
             ..ChatChunk::default()
         };
         let (state, events) = collect(&[usage], false);

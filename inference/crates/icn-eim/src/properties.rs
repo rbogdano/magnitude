@@ -100,7 +100,13 @@ impl ModelPropertiesSpec {
         digest.update([0]);
         digest.update(self.served_model_name.as_bytes());
         digest.update([0]);
-        digest.update(self.reasoning.default_effort.as_deref().unwrap_or("").as_bytes());
+        digest.update(
+            self.reasoning
+                .default_effort
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes(),
+        );
         for effort in &self.reasoning.efforts {
             digest.update([0]);
             digest.update(effort.as_bytes());
@@ -143,9 +149,7 @@ impl ModelPropertiesSpec {
         TemplateCapabilities {
             string_content: true,
             // Only a multimodal model accepts the typed content-part form.
-            typed_content: self.modalities.vision
-                || self.modalities.audio
-                || self.modalities.video,
+            typed_content: self.modalities.vision || self.modalities.audio || self.modalities.video,
             tools: self.tools,
             tool_calls: self.tools,
             parallel_tool_calls: self.tools,
@@ -242,9 +246,12 @@ mod tests {
 
         // Without a parser vLLM returns tool calls as prose, so claiming support would make
         // the agent loop fail silently instead of the model being marked unusable.
-        let without = ModelPropertiesSpec { tools: false, ..spec() }
-            .to_model_properties()
-            .capabilities;
+        let without = ModelPropertiesSpec {
+            tools: false,
+            ..spec()
+        }
+        .to_model_properties()
+        .capabilities;
         assert!(!without.tools && !without.tool_calls && !without.parallel_tool_calls);
     }
 
@@ -259,7 +266,11 @@ mod tests {
         assert!(!spec().to_model_properties().capabilities.typed_content);
 
         let vision = ModelPropertiesSpec {
-            modalities: ModelModalities { vision: true, audio: false, video: false },
+            modalities: ModelModalities {
+                vision: true,
+                audio: false,
+                video: false,
+            },
             ..spec()
         };
         assert!(vision.to_model_properties().capabilities.typed_content);
@@ -270,7 +281,10 @@ mod tests {
         let reasoning = spec().to_model_properties().reasoning;
 
         assert_eq!(
-            reasoning.default_effort.as_ref().map(|effort| effort.0.as_str()),
+            reasoning
+                .default_effort
+                .as_ref()
+                .map(|effort| effort.0.as_str()),
             Some("high")
         );
         assert_eq!(reasoning.mappings.len(), 2);
@@ -316,11 +330,26 @@ mod tests {
         let baseline = spec().template_fingerprint();
 
         let variants = [
-            ModelPropertiesSpec { image_digest: "0".repeat(64), ..spec() },
-            ModelPropertiesSpec { eim_profile_id: "vllm-xeon-bf16-tp1".to_owned(), ..spec() },
-            ModelPropertiesSpec { served_model_name: "other".to_owned(), ..spec() },
-            ModelPropertiesSpec { reasoning: ReasoningDeclaration::unsupported(), ..spec() },
-            ModelPropertiesSpec { tools: false, ..spec() },
+            ModelPropertiesSpec {
+                image_digest: "0".repeat(64),
+                ..spec()
+            },
+            ModelPropertiesSpec {
+                eim_profile_id: "vllm-xeon-bf16-tp1".to_owned(),
+                ..spec()
+            },
+            ModelPropertiesSpec {
+                served_model_name: "other".to_owned(),
+                ..spec()
+            },
+            ModelPropertiesSpec {
+                reasoning: ReasoningDeclaration::unsupported(),
+                ..spec()
+            },
+            ModelPropertiesSpec {
+                tools: false,
+                ..spec()
+            },
         ];
         for variant in variants {
             assert_ne!(

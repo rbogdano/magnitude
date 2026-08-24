@@ -1,40 +1,51 @@
+//! Live system-memory observation and the admission/eviction thresholds it feeds.
+//!
+//! Moved from icn-server unchanged in substance. It was never native: the policy comes from
+//! `icn-hardware` and the sampling from `sysinfo`. What changed is who it watches. It used to
+//! measure a llama.cpp worker process; a container's memory is accounted by the kernel against
+//! its cgroup, so `resident_bytes` now takes whatever pid the caller resolves for a container.
+//!
+//! Admission deliberately gates on whole-system headroom rather than the container limit. A
+//! second container, a build, or anything else on the host can exhaust memory that the limit
+//! alone would have suggested was available.
+
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
-pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(100);
-pub(crate) const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
-pub(crate) const MONITOR_LOSS_DEADLINE: Duration = Duration::from_secs(1);
-pub(crate) const RECOVERY_STABLE_TIME: Duration = Duration::from_secs(5);
-pub(crate) const RECOVERY_MARGIN_BYTES: u64 = 512 * 1024 * 1024;
+pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
+pub const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+pub const MONITOR_LOSS_DEADLINE: Duration = Duration::from_secs(1);
+pub const RECOVERY_STABLE_TIME: Duration = Duration::from_secs(5);
+pub const RECOVERY_MARGIN_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MemorySample {
-    pub(crate) captured_at: Instant,
-    pub(crate) physical_capacity_bytes: u64,
-    pub(crate) physical_available_bytes: u64,
-    pub(crate) allocation_capacity_bytes: u64,
-    pub(crate) allocation_headroom_bytes: u64,
+pub struct MemorySample {
+    pub captured_at: Instant,
+    pub physical_capacity_bytes: u64,
+    pub physical_available_bytes: u64,
+    pub allocation_capacity_bytes: u64,
+    pub allocation_headroom_bytes: u64,
 }
 
 impl MemorySample {
-    pub(crate) fn abort_reserve_bytes(self) -> u64 {
+    pub fn abort_reserve_bytes(self) -> u64 {
         icn_hardware::system_memory_thresholds(self.physical_capacity_bytes).abort_reserve_bytes
     }
 
-    pub(crate) fn permits_load(self, required_system_memory_bytes: u64) -> bool {
+    pub fn permits_load(self, required_system_memory_bytes: u64) -> bool {
         let required = self
             .abort_reserve_bytes()
             .saturating_add(required_system_memory_bytes);
         self.allocation_headroom_bytes > required
     }
 
-    pub(crate) fn requires_eviction(self) -> bool {
+    pub fn requires_eviction(self) -> bool {
         self.allocation_headroom_bytes <= self.abort_reserve_bytes()
     }
 
-    pub(crate) fn recovered(self) -> bool {
+    pub fn recovered(self) -> bool {
         let required = self
             .abort_reserve_bytes()
             .saturating_add(RECOVERY_MARGIN_BYTES);
@@ -42,12 +53,19 @@ impl MemorySample {
     }
 }
 
-pub(crate) struct SystemMemoryObserver {
+pub struct SystemMemoryObserver {
     system: Mutex<System>,
 }
 
+impl Default for SystemMemoryObserver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SystemMemoryObserver {
-    pub(crate) fn new() -> Self {
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             system: Mutex::new(System::new_with_specifics(
                 RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
@@ -55,7 +73,7 @@ impl SystemMemoryObserver {
         }
     }
 
-    pub(crate) fn sample(&self) -> Result<MemorySample, String> {
+    pub fn sample(&self) -> Result<MemorySample, String> {
         let mut system = self
             .system
             .lock()
@@ -74,7 +92,7 @@ impl SystemMemoryObserver {
         })
     }
 
-    pub(crate) fn worker_resident_bytes(&self, pid: u32) -> Option<u64> {
+    pub fn resident_bytes(&self, pid: u32) -> Option<u64> {
         let mut system = self.system.lock().ok()?;
         let pid = Pid::from_u32(pid);
         system.refresh_processes_specifics(

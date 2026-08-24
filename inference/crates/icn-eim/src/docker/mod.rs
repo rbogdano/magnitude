@@ -15,4 +15,4 @@ pub mod naming;
 
 pub use cli::{DockerCli, DockerError, DockerInvocation, DockerPreflight};
 pub use inspect::{ContainerState, ContainerStatus, ImageSummary};
-pub use naming::{ContainerLabels, OwnedContainer, OWNER_LABEL, OWNER_VALUE};
+pub use naming::{ContainerLabels, OWNER_LABEL, OWNER_VALUE, OwnedContainer};

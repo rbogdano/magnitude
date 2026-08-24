@@ -92,7 +92,11 @@ impl OwnedContainer {
     /// Containers whose recorded pid is still alive are left alone even when the instance id
     /// differs, because a second ICN may legitimately be running alongside this one.
     #[must_use]
-    pub fn is_orphan_of(&self, current_instance_id: &str, pid_is_alive: impl Fn(u32) -> bool) -> bool {
+    pub fn is_orphan_of(
+        &self,
+        current_instance_id: &str,
+        pid_is_alive: impl Fn(u32) -> bool,
+    ) -> bool {
         if self.icn_instance_id.as_deref() == Some(current_instance_id) {
             return false;
         }

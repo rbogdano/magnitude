@@ -197,7 +197,12 @@ fn observe_numa_nodes() -> usize {
             let start = bounds.next()?.trim().parse::<usize>().ok()?;
             match bounds.next() {
                 None => Some(1),
-                Some(end) => end.trim().parse::<usize>().ok()?.checked_sub(start)?.checked_add(1),
+                Some(end) => end
+                    .trim()
+                    .parse::<usize>()
+                    .ok()?
+                    .checked_sub(start)?
+                    .checked_add(1),
             }
         })
         .sum();
@@ -232,10 +237,7 @@ pub fn discover_hardware(
         native_index: 0,
         backend: XEON_VLLM_BACKEND.to_owned(),
         physical_id: None,
-        name: host
-            .cpu_model
-            .clone()
-            .unwrap_or_else(|| "CPU".to_owned()),
+        name: host.cpu_model.clone().unwrap_or_else(|| "CPU".to_owned()),
         description: format!(
             "{} ({} logical cores, {} NUMA node{})",
             host.cpu_model.as_deref().unwrap_or("CPU"),
@@ -380,7 +382,10 @@ mod tests {
         assert_eq!(snapshot.memory_domains.len(), 1);
         assert_eq!(snapshot.memory_domains[0].id, MemoryDomainId::system());
         assert_eq!(snapshot.memory_domains[0].devices.len(), 1);
-        assert_eq!(snapshot.enabled_backends, vec![XEON_VLLM_BACKEND.to_owned()]);
+        assert_eq!(
+            snapshot.enabled_backends,
+            vec![XEON_VLLM_BACKEND.to_owned()]
+        );
         assert_eq!(snapshot.logical_cores, 256);
         assert!(!snapshot.topology_fingerprint.is_empty());
         // The snapshot must be convertible to the topology assessments are validated against.

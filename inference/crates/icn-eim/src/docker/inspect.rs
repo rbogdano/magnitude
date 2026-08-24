@@ -109,11 +109,7 @@ impl ImageSummary {
     pub fn from_json(payload: &str) -> Result<Self, serde_json::Error> {
         let raw: RawImageSummary = serde_json::from_str(payload.trim())?;
         Ok(Self {
-            content_digest: raw
-                .id
-                .strip_prefix("sha256:")
-                .unwrap_or(&raw.id)
-                .to_owned(),
+            content_digest: raw.id.strip_prefix("sha256:").unwrap_or(&raw.id).to_owned(),
             size_bytes: raw.size,
             repo_digests: raw.repo_digests,
         })

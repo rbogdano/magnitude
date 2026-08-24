@@ -6,18 +6,29 @@ use std::process::Command;
 fn main() {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set"));
-    let pin_path = manifest_dir.join("../../native-pin.toml");
+    let pin_path = manifest_dir.join("../../eim-pin.toml");
     println!("cargo:rerun-if-changed={}", pin_path.display());
 
     let pin = fs::read_to_string(&pin_path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", pin_path.display()));
-    let bindings_revision = table_value(&pin, "llama_cpp_rs", "revision")
-        .unwrap_or_else(|| panic!("missing llama_cpp_rs.revision in {}", pin_path.display()));
-    let native_backend_revision = table_value(&pin, "llama_cpp", "revision")
-        .unwrap_or_else(|| panic!("missing llama_cpp.revision in {}", pin_path.display()));
+    let eim_revision = table_value(&pin, "eim", "revision")
+        .unwrap_or_else(|| panic!("missing eim.revision in {}", pin_path.display()));
+    let base_image_part = |key: &str| {
+        table_value(&pin, "base_image", key)
+            .unwrap_or_else(|| panic!("missing base_image.{key} in {}", pin_path.display()))
+    };
+    let base_image = format!(
+        "{}/{}:{}",
+        base_image_part("registry_host"),
+        base_image_part("base_repository"),
+        base_image_part("base_tag"),
+    );
+    let image_tag_prefix = table_value(&pin, "images", "tag_prefix")
+        .unwrap_or_else(|| panic!("missing images.tag_prefix in {}", pin_path.display()));
 
-    emit("ICN_BINDINGS_REVISION", &bindings_revision);
-    emit("ICN_NATIVE_BACKEND_REVISION", &native_backend_revision);
+    emit("ICN_EIM_REVISION", &eim_revision);
+    emit("ICN_EIM_BASE_IMAGE", &base_image);
+    emit("ICN_EIM_IMAGE_TAG_PREFIX", &image_tag_prefix);
     emit(
         "ICN_BUILD_TARGET",
         &env::var("TARGET").expect("TARGET must be set"),
@@ -27,11 +38,6 @@ fn main() {
         &env::var("PROFILE").expect("PROFILE must be set"),
     );
     emit("ICN_RUSTC_VERSION", &rustc_version());
-    match env::var("CARGO_CFG_TARGET_OS").as_deref() {
-        Ok("linux") => println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../runtime"),
-        Ok("macos") => println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/../runtime"),
-        _ => {}
-    }
 }
 
 fn table_value(source: &str, wanted_table: &str, wanted_key: &str) -> Option<String> {

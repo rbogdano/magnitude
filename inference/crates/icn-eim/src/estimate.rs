@@ -5,11 +5,12 @@
 //! from outside, so fit is computed instead from six numbers per model, recorded in the catalog
 //! overlay at authoring time and read from each model's Hugging Face `config.json`.
 //!
-//! The estimate is deliberately simple and slightly conservative. On the target host (Xeon
-//! 6767P, 256 GB) it is informational far more often than it is a gate: only one model in the
-//! EIM catalog, Llama-4-Scout, actually fails to fit. Its value is therefore in what it shows
-//! the user — "this will use 72 GB of your 230 GB" — which is why the four memory buckets are
-//! filled in honestly instead of being lumped into `auxiliary_bytes`.
+//! The estimate is deliberately simple and slightly conservative. On the measured target host
+//! (Xeon 6767P, 269.9 GB physical, ~243 GB after the reserve policy) it is informational far
+//! more often than it is a gate: only one model in the EIM catalog, Llama-4-Scout, actually
+//! fails to fit. Its value is therefore in what it shows the user — "this will use 72 GB of
+//! your 243 GB" — which is why the four memory buckets are filled in honestly rather than
+//! lumped into `auxiliary_bytes`.
 
 use icn_contracts::{
     HardwareAssessment, HardwareDeficit, HardwareMemory, HardwareMemoryDomainAssessment,
@@ -120,10 +121,7 @@ impl MemoryEstimate {
         }
     }
 
-    fn domain_assessment(
-        &self,
-        usable_capacity_bytes: u64,
-    ) -> HardwareMemoryDomainAssessment {
+    fn domain_assessment(&self, usable_capacity_bytes: u64) -> HardwareMemoryDomainAssessment {
         HardwareMemoryDomainAssessment {
             memory_domain: MemoryDomainId::system(),
             model_bytes: self.weight_bytes,
@@ -282,9 +280,14 @@ fn shortest_fitting_context(
 mod tests {
     use super::*;
 
-    /// Xeon 6767P with 256 GB, minus the 10% assess reserve: the real target host.
+    /// The measured target host: `magnitude-icn doctor` on the Xeon 6767P reports exactly
+    /// this many bytes of physical memory (251 GiB). Using the measured figure rather than the
+    /// marketing "256 GB" matters: it moves the budget to ~243 GB, which is what decides how
+    /// much margin the Llama-4-Scout rejection actually has.
+    const TARGET_HOST_PHYSICAL_BYTES: u64 = 269_853_134_848;
+
     fn target_host_budget() -> HostBudget {
-        let physical = 256 * 1000 * 1000 * 1000_u64;
+        let physical = TARGET_HOST_PHYSICAL_BYTES;
         HostBudget {
             stable_capacity_bytes: physical
                 - icn_hardware::system_memory_thresholds(physical).assess_reserve_bytes,
@@ -354,7 +357,10 @@ mod tests {
 
         // `distributed-executor-backend: mp` spawns one process per rank.
         assert_eq!(tp2.runtime_bytes, 2 * tp1.runtime_bytes);
-        assert_eq!(tp2.required_bytes - tp1.required_bytes, RUNTIME_BASELINE_BYTES);
+        assert_eq!(
+            tp2.required_bytes - tp1.required_bytes,
+            RUNTIME_BASELINE_BYTES
+        );
     }
 
     #[test]
@@ -388,9 +394,13 @@ mod tests {
                 recommendation,
                 ..
             } => {
-                // Roughly 72 GB against a ~230 GB budget.
-                assert!(memory.required_bytes < 80_000_000_000, "{}", memory.required_bytes);
-                assert!(memory.headroom_bytes > 140_000_000_000);
+                // Roughly 72 GB against a ~243 GB budget.
+                assert!(
+                    memory.required_bytes < 80_000_000_000,
+                    "{}",
+                    memory.required_bytes
+                );
+                assert!(memory.headroom_bytes > 150_000_000_000);
                 assert_eq!(recommendation, HardwareRecommendation::Recommended);
                 assert_eq!(memory.domains.len(), 1);
                 assert!(memory.domains[0].margin_bytes > 0);
@@ -401,9 +411,11 @@ mod tests {
 
     #[test]
     fn llama4_scout_does_not_fit_and_no_shorter_context_rescues_it() {
-        // 109B parameters at bf16 is 218 GB of weights alone, against a ~230 GB budget once
-        // activations and the runtime baseline are added. This is the assessment's whole point:
-        // reject it before the user waits out a 218 GB download.
+        // 109B parameters at bf16 is 218 GB of weights alone. With activations, the vision
+        // tower, per-rank runtime and KV cache it needs ~255 GB against a ~243 GB budget --
+        // only a 5% margin, so this doubles as a sensitivity test on the formula's constants.
+        // Its real point is to reject the model before the user waits out a 218 GB download
+        // and is then OOM-killed.
         let assessment = assess(
             &llama4_scout(),
             &shape(32_768, 2),
@@ -418,11 +430,18 @@ mod tests {
                 alternative,
                 ..
             } => {
-                assert!(memory.required_bytes > 230_000_000_000, "{}", memory.required_bytes);
+                assert!(
+                    memory.required_bytes > TARGET_HOST_PHYSICAL_BYTES / 10 * 9,
+                    "{}",
+                    memory.required_bytes
+                );
                 assert!(memory.deficit_bytes > 0);
                 assert_eq!(limiting_resource, "system memory");
                 // Weights dominate, so shortening the context cannot help.
-                assert!(alternative.is_none(), "unexpected alternative: {alternative:?}");
+                assert!(
+                    alternative.is_none(),
+                    "unexpected alternative: {alternative:?}"
+                );
             }
             other => panic!("expected DoesNotFit, got {other:?}"),
         }
@@ -458,8 +477,14 @@ mod tests {
 
     #[test]
     fn charges_a_margin_for_a_vision_tower() {
-        let text_only = ModelGeometry { vision: false, ..qwen3_30b_a3b() };
-        let multimodal = ModelGeometry { vision: true, ..qwen3_30b_a3b() };
+        let text_only = ModelGeometry {
+            vision: false,
+            ..qwen3_30b_a3b()
+        };
+        let multimodal = ModelGeometry {
+            vision: true,
+            ..qwen3_30b_a3b()
+        };
 
         let delta = MemoryEstimate::compute(&multimodal, &shape(32_768, 2)).required_bytes
             - MemoryEstimate::compute(&text_only, &shape(32_768, 2)).required_bytes;
@@ -505,21 +530,28 @@ mod tests {
         let geometry = qwen3_30b_a3b();
 
         // Generous budget: the cap, not memory, is the limit.
-        let generous = largest_fitting_shape(&geometry, 32_768, 2, &target_host_budget())
-            .expect("should fit");
+        let generous =
+            largest_fitting_shape(&geometry, 32_768, 2, &target_host_budget()).expect("should fit");
         assert_eq!(generous.parallel_sequences, MAX_DYNAMIC_PARALLEL_SEQUENCES);
 
         // A budget that admits exactly one sequence.
         let one_sequence_bytes = MemoryEstimate::compute(
             &geometry,
-            &ServingShape { context_tokens: 32_768, parallel_sequences: 1, tensor_parallel_size: 2 },
+            &ServingShape {
+                context_tokens: 32_768,
+                parallel_sequences: 1,
+                tensor_parallel_size: 2,
+            },
         )
         .required_bytes;
         let tight = largest_fitting_shape(
             &geometry,
             32_768,
             2,
-            &HostBudget { stable_capacity_bytes: one_sequence_bytes, container_limit_bytes: None },
+            &HostBudget {
+                stable_capacity_bytes: one_sequence_bytes,
+                container_limit_bytes: None,
+            },
         )
         .expect("one sequence should fit");
         assert_eq!(tight.parallel_sequences, 1);
@@ -528,13 +560,7 @@ mod tests {
     #[test]
     fn reports_no_fitting_shape_when_even_one_sequence_overflows() {
         assert!(
-            largest_fitting_shape(
-                &llama4_scout(),
-                32_768,
-                2,
-                &target_host_budget(),
-            )
-            .is_none()
+            largest_fitting_shape(&llama4_scout(), 32_768, 2, &target_host_budget(),).is_none()
         );
     }
 }

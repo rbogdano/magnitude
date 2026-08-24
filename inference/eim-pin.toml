@@ -1,0 +1,34 @@
+# Intel EIM pins, replacing native-pin.toml.
+#
+# ICN no longer compiles a native inference backend, so there is nothing to pin at the source
+# level. What must be pinned instead is the container: which EIM revision the serving images are
+# built from, and which vLLM base image those layers sit on. Both feed `eim_build()`, which ACN
+# verifies against the startup record — so a mismatched installation is rejected by an invariant
+# that already existed for exactly this class of problem.
+
+schema_version = 1
+
+[eim]
+repository = "https://github.com/intel-innersource/applications.ai.enterprise.eim"
+revision = "067a85660c8fa47dcf3029a294c34d9c0c604046"
+# Where a checkout is expected when images have to be built locally. Overridable with
+# MAGNITUDE_EIM_SOURCE, because EIM lives in a separate repository rather than a submodule:
+# its metadata.yaml carries none of the geometry the RAM formula needs, so a submodule would
+# still require the catalog overlay and would add a large Python tree to every clone.
+checkout_path = "native/eim"
+
+# From EIM's assets/xeon/base/config.yaml. Its accepted vLLM engine arguments, tool-call parser
+# names, and usage-reporting shape all track this image, which is why it is pinned here and
+# folded into the build identity.
+[base_image]
+registry_host = "docker.io"
+base_repository = "vllm/vllm-openai-cpu"
+base_tag = "v0.26.0"
+
+[images]
+# Serving images are named <tag_prefix>-<org>-<model>, OCI-sanitized.
+tag_prefix = "magnitude-eim-xeon"
+# Leave empty to build locally. Set it to pull prebuilt images instead: EIM publishes none of
+# its own, so a private registry is the recommended production path and a local build is the
+# developer path.
+registry = ""
