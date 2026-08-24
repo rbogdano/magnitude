@@ -45,9 +45,21 @@ profiles are usable.
     bun icn:dev                  # deterministic in-memory backend, no daemon needed
     bun icn:serve                # build and serve for real
 
-Serving a model needs a built image and the model table:
+The model table is built into the binary, so a plain `serve` already publishes the catalog. That is
+deliberate: nothing in the TypeScript launch path passes a catalog path, and the client cannot become
+ready without a catalog. `--eim-catalog` only overrides it, and the shipped table is pinned to the
+same base image as the engine arguments it declares.
 
-    magnitude-icn serve --eim-catalog eim/models.json --eim-source ~/eim
+What `serve` does *not* know is where serving images come from, so installing a model needs one more
+setting:
+
+    magnitude-icn serve --eim-source ~/eim
+
+Under the desktop or CLI client, ICN is spawned by ACN, which passes no EIM flags at all — the child
+inherits ACN's environment instead, so set these before starting Magnitude:
+
+    export MAGNITUDE_EIM_SOURCE=~/eim        # or MAGNITUDE_EIM_REGISTRY
+    export HTTPS_PROXY=... HTTP_PROXY=...    # on a network without direct internet access
 
 With `--eim-source` a missing image is built from that EIM checkout; with `--eim-registry` it is
 pulled instead, which is the recommended production shape because a build is multi-gigabyte and
@@ -55,9 +67,9 @@ multi-minute. With neither, a missing image is reported rather than fetched: sta
 unasked on an operator's host is not a reasonable default.
 
 Installing a model prepares that image and then fetches its weights from Hugging Face into the
-layout EIM reads, so export proxy variables before starting on a network without direct access —
-the daemon's proxy configuration does not reach this process, and the resulting timeout reads like a
-Hugging Face outage rather than missing configuration.
+layout EIM reads. The proxy has to be in ICN's own environment: the Docker daemon's configuration
+does not reach this process, and the resulting timeout reads like a Hugging Face outage rather than
+missing configuration.
 
 EIM publishes no images of its own — its CI builds with `push: false` — so one of those two is
 required.

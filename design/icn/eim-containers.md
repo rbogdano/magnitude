@@ -128,10 +128,19 @@ what EIM's own documentation implies. Absence from documentation is not evidence
 
 ## Orphans
 
-Every container carries the owning ICN's instance identity and process id. A restarted ICN removes
-containers whose owner is gone, and leaves alone those whose recorded process is still alive. This
-is not optional bookkeeping: the client's shutdown ends in `SIGKILL` after a short grace period, and
-an unlabelled container would survive invisibly holding tens of gigabytes.
+Every container carries the owning ICN's instance identity and process id. Liveness of that pid is
+what decides whether a container is abandoned — never the instance identity, which ACN keeps stable
+across restarts, so a successor carries its predecessor's id and would otherwise adopt containers it
+cannot use. The container name is derived from the same identity, so an adopted container also makes
+the model unservable until someone removes it by hand.
+
+Shutdown releases what this process owns, and that is a separate job from reaping: the reaper skips
+containers whose owner is alive, and on the way out that owner is us. A clean exit that skipped it
+would leave the whole model's memory held until some later ICN happened to start.
+
+None of this is optional bookkeeping. The client's shutdown ends in `SIGKILL` after a short grace
+period, so the boot-time sweep is the only thing standing between that and tens of gigabytes held by
+an invisible container.
 
 ## Failures name their cause
 
@@ -147,6 +156,7 @@ configuration mistake is not.
 - `bun icn:check-generated` passes with no diff.
 - At most one instance is present in the snapshot at any time, and a stale instance cannot be leased.
 - Every model in the table appears in the catalog; an unusable one carries a reason and a note.
+- A plain `serve` with no EIM flags publishes the full catalog, because that is how ACN starts ICN.
 - A container that dies during startup is detected from its state within one poll interval, not by
   waiting out the readiness budget.
 - Stopping an instance removes its container, and a restarted ICN reaps what a killed predecessor

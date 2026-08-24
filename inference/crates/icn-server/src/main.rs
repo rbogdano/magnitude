@@ -99,9 +99,9 @@ enum Command {
         /// publishes no images, so this is the developer path.
         #[arg(long, env = "MAGNITUDE_EIM_SOURCE")]
         eim_source: Option<PathBuf>,
-        /// JSON table of servable EIM models. Stage 2 replaces this with the generated catalog
-        /// and its geometry overlay; until that overlay exists, supplying the table as data
-        /// avoids inventing the layer and head counts the RAM estimate depends on.
+        /// JSON table of servable EIM models, overriding the one this build ships. Only for
+        /// trying a table out: the shipped one is pinned to the same base image as the engine
+        /// arguments it declares, and a substituted table breaks that correspondence.
         #[arg(long, env = "MAGNITUDE_EIM_CATALOG")]
         eim_catalog: Option<PathBuf>,
         /// Hugging Face endpoint weights are fetched from.
@@ -215,14 +215,16 @@ async fn main() -> anyhow::Result<()> {
                     "docker daemon ready"
                 );
 
+                // The shipped table is the default. The client cannot become ready without a
+                // catalog, and nothing in the TypeScript launch path passes a path to one.
                 let definitions = match &eim_catalog {
-                    Some(path) => EimModelDefinition::load_table(path)
-                        .map_err(|error| anyhow::anyhow!(error))?,
-                    None => Vec::new(),
-                };
+                    Some(path) => EimModelDefinition::load_table(path),
+                    None => EimModelDefinition::shipped_table(),
+                }
+                .map_err(|error| anyhow::anyhow!(error))?;
                 tracing::info!(
                     servable_models = definitions.len(),
-                    catalog = ?eim_catalog,
+                    catalog = ?eim_catalog.as_deref().map_or("shipped", |_| "supplied"),
                     "EIM model table loaded"
                 );
 
@@ -329,6 +331,9 @@ async fn main() -> anyhow::Result<()> {
             if let Some(downloads) = downloads {
                 state = state.with_model_downloads(downloads);
             }
+            // Kept for the shutdown path: the state builder consumes the controller, and a
+            // detached container has to be released by name once serving ends.
+            let released = controller.clone();
             if let Some(controller) = controller {
                 state = state.with_model_controller(controller);
             }
@@ -367,6 +372,16 @@ async fn main() -> anyhow::Result<()> {
             axum::serve(listener, app)
                 .with_graceful_shutdown(interrupt_signal())
                 .await?;
+
+            // A detached container outlives the process that started it, so shutdown has to say so
+            // explicitly. Skipping this leaves the whole model's memory held until some later ICN
+            // starts and reaps it.
+            if let Some(controller) = &released {
+                let released = controller.release_owned().await;
+                if !released.is_empty() {
+                    tracing::info!(?released, "released containers on shutdown");
+                }
+            }
             tracing::info!("ICN server stopped");
         }
         Command::Doctor { json } => {

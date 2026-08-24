@@ -100,11 +100,31 @@ impl EimModelDefinition {
     /// that overlay is authored from each model's `config.json`, supplying the table as data
     /// is the honest option: inventing layer counts and key-value head counts would make the
     /// RAM estimate confidently wrong.
+    /// The table this fork ships, used when none is supplied.
+    ///
+    /// Embedded rather than staged as a file because the catalog is not an operator input: it is
+    /// Magnitude's own metadata over the models EIM ships, and its per-model engine arguments —
+    /// tool-call parser names above all — are only valid for the pinned base image. Shipping the
+    /// two together means they cannot drift apart. And the client cannot start without a catalog,
+    /// so requiring a flag for it would make the product broken by default: nothing in the
+    /// TypeScript launch path passes one.
+    pub fn shipped_table() -> Result<Vec<Self>, String> {
+        Self::parse_table(
+            include_str!("../../../eim/models.json"),
+            "the shipped model table",
+        )
+    }
+
     pub fn load_table(path: &std::path::Path) -> Result<Vec<Self>, String> {
         let source = std::fs::read_to_string(path)
             .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-        let definitions: Vec<Self> = serde_json::from_str(&source)
-            .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+        Self::parse_table(&source, &path.display().to_string())
+    }
+
+    /// Parses a model table, validating what a typo would otherwise turn into a silent gap.
+    pub fn parse_table(source: &str, origin: &str) -> Result<Vec<Self>, String> {
+        let definitions: Vec<Self> = serde_json::from_str(source)
+            .map_err(|error| format!("could not parse {origin}: {error}"))?;
 
         let mut seen = std::collections::BTreeSet::new();
         for definition in &definitions {
@@ -332,6 +352,35 @@ impl EimModelInstanceController {
     /// Runs at boot. Without it a `SIGKILL`ed ICN — which is exactly how the client's shutdown
     /// ends if the graceful window elapses — leaves a container holding tens of gigabytes with
     /// nothing tracking it.
+    /// Removes every container this process owns, on the way out.
+    ///
+    /// Not the same job as `reap_orphans`, which skips containers whose owner is alive — and on the
+    /// shutdown path that owner is us. Without this a clean shutdown leaves the resident container
+    /// running and holding the whole model's memory until some later ICN starts and reaps it, which
+    /// for a user who closes Magnitude and does not reopen it is indefinitely.
+    pub async fn release_owned(&self) -> Vec<String> {
+        let owned = match self.shared.docker.list_owned().await {
+            Ok(owned) => owned,
+            Err(error) => {
+                tracing::warn!(%error, "could not list ICN-owned containers on shutdown");
+                return Vec::new();
+            }
+        };
+        let ours = std::process::id();
+        let mut released = Vec::new();
+        for container in owned {
+            if container.pid != Some(ours) {
+                continue;
+            }
+            tracing::info!(container = %container.name, "releasing container on shutdown");
+            let _ = self.shared.docker.stop(&container.name, 10).await;
+            if self.shared.docker.remove(&container.name).await.is_ok() {
+                released.push(container.name);
+            }
+        }
+        released
+    }
+
     pub async fn reap_orphans(&self) -> Vec<String> {
         let owned = match self.shared.docker.list_owned().await {
             Ok(owned) => owned,
@@ -1289,6 +1338,50 @@ mod tests {
             EimControllerConfig::default(),
             Handle::current(),
         )
+    }
+
+    #[test]
+    fn the_shipped_table_is_the_catalog_the_client_gets() {
+        // Nothing in the TypeScript launch path passes `--eim-catalog`, and the client cannot
+        // become ready without a catalog, so an unparseable shipped table is a product that starts
+        // with an empty model picker.
+        let definitions =
+            EimModelDefinition::shipped_table().expect("the shipped table must parse");
+
+        assert_eq!(definitions.len(), 15, "the closed set of models EIM ships");
+        for definition in &definitions {
+            assert!(
+                !definition.image.is_empty(),
+                "{} has no serving image",
+                definition.canonical_name
+            );
+            assert!(
+                definition.geometry.num_hidden_layers > 0,
+                "{} has no geometry, so its memory estimate would be fiction",
+                definition.canonical_name
+            );
+            assert!(
+                definition.weight_bytes > 0,
+                "{} has no weight size, so its download has no total",
+                definition.canonical_name
+            );
+        }
+    }
+
+    #[test]
+    fn every_model_that_claims_tool_calling_names_a_parser() {
+        // The catalog presents a model as agent-usable on the strength of this field. A model that
+        // claims support without one returns tool calls as prose and the agent loop fails silently.
+        for definition in EimModelDefinition::shipped_table().expect("the shipped table") {
+            if let Some(parser) = &definition.tool_call_parser {
+                assert!(!parser.is_empty(), "{}", definition.canonical_name);
+                assert!(
+                    definition.context_tokens > 0,
+                    "{}",
+                    definition.canonical_name
+                );
+            }
+        }
     }
 
     #[tokio::test]
