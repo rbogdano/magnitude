@@ -12,6 +12,7 @@
 //!   - `estimate` — model fit from catalog geometry, replacing the native `common/fit` planner
 //!   - `memory`   — live system-memory sampling and the admission/eviction thresholds
 //!   - `properties` — ModelProperties synthesis for a container-backed model
+//!   - `readiness` — waiting for a container to start serving, and reading its served name
 //!   - `request`  — ChatRequest to a vLLM chat-completions body
 //!   - `sse`      — server-sent event framing and OpenAI chat-chunk decoding
 
@@ -20,5 +21,6 @@ pub mod docker;
 pub mod estimate;
 pub mod memory;
 pub mod properties;
+pub mod readiness;
 pub mod request;
 pub mod sse;
