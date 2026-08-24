@@ -181,49 +181,83 @@ impl HostBudget {
     }
 }
 
-/// Headroom above the estimate when telling vLLM how much of a NUMA node to reserve.
+/// Memory the container holds before any vLLM worker starts.
 ///
-/// The estimate is a model of allocation, not a measurement of it, so the reservation is asked
-/// for with margin. Too tight and the engine runs out mid-load; too loose and it refuses to
-/// start because the node does not have that much free.
-const CPU_UTILIZATION_SAFETY_NUMERATOR: u64 = 3;
-const CPU_UTILIZATION_SAFETY_DENOMINATOR: u64 = 2;
+/// vLLM checks its requested reservation against memory *currently available* rather than against
+/// the ceiling, and by the time a worker initializes the python interpreter, torch and EIM's
+/// launcher are already resident. Measured at 1.94 GiB on the Xeon; carried at double that,
+/// because underestimating it is a refusal to start and overestimating it costs a rounding error
+/// on a host with hundreds of gigabytes.
+const STARTUP_RESERVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Never reserve less than this fraction of a node: vLLM needs room for its own bookkeeping
-/// beyond what the model accounts for.
+/// Never reserve less than this: vLLM needs room for its own bookkeeping beyond the model.
 const MINIMUM_CPU_UTILIZATION: f64 = 0.05;
-/// Never ask for more than this. vLLM compares the request against *currently free* memory, so
-/// asking for nearly the whole node fails on any host that is doing anything else at all --
-/// which is exactly how the default of 0.92 fails on an almost idle machine.
-const MAXIMUM_CPU_UTILIZATION: f64 = 0.85;
+/// Never claim the whole ceiling: `STARTUP_RESERVE_BYTES` has to stay outside the workers.
+const MAXIMUM_CPU_UTILIZATION: f64 = 0.95;
 
-/// The fraction of one NUMA node vLLM should reserve, for `--gpu-memory-utilization`.
+/// The container memory ceiling and the engine's reservation fraction, which must agree.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContainerMemoryPlan {
+    /// `docker run --memory`, and `--memory-swap` set to the same value.
+    pub limit_bytes: u64,
+    /// `--gpu-memory-utilization`, which on the CPU backend is a fraction of `limit_bytes`.
+    pub utilization: f64,
+}
+
+/// Derives both container memory controls from one estimate.
 ///
-/// Despite the name, that flag controls CPU memory on the CPU backend, and it is a fraction of
-/// a *node* rather than an absolute size. This is the value that actually decides whether a
-/// container starts: vLLM's default of 0.92 asks for 92% of every node and fails on a host with
-/// anything else resident. No shipped EIM profile sets it.
+/// They are produced together because they multiply, and every way of getting this wrong was
+/// observed on real hardware rather than reasoned about. vLLM 0.26 on the CPU backend:
 ///
-/// With `distributed-executor-backend: mp` each tensor-parallel rank binds one node and holds
-/// its shard, so the per-node requirement is the estimate divided by the rank count.
+/// ```text
+/// Auto set (5.37/32.72) GiB for KV cache on node 1, with 11.11 GiB requested memory for the
+/// worker. 5.74 GiB memory was consumed by non-kv usages.
+/// ```
+/// ```text
+/// ValueError: Available memory on node 0 (30.78/32.72 GiB) on startup is less than desired CPU
+/// memory utilization (0.95, 31.08 GiB).
+/// ```
+///
+/// Three facts follow, and each one broke a load before it was known:
+///
+/// 1. The fraction is of the container's cgroup limit, not of a NUMA node. Treating it as a node
+///    fraction while the cgroup is far smaller shrinks the real budget by the ratio between them,
+///    which is what left a healthy 4B model with 1.47 GiB of key-value cache where it needed 18.
+/// 2. *Each* tensor-parallel worker claims that fraction independently, so the reservation across
+///    the container is `utilization x limit x ranks`. Ignoring the multiplication overcommits the
+///    cgroup and earns an out-of-memory kill part-way through loading.
+/// 3. The check is against memory currently available, not against the ceiling, so the ceiling
+///    must exceed the workers' share by whatever is already resident.
+///
+/// Hence: the ceiling is the estimate with its slack *plus* the startup reserve, and the fraction
+/// hands the ranks exactly the part that is not the reserve.
 #[must_use]
-pub fn cpu_memory_utilization(
+pub fn container_memory_plan(
     estimate: &MemoryEstimate,
     tensor_parallel_size: u32,
-    node_capacity_bytes: u64,
-) -> f64 {
-    if node_capacity_bytes == 0 {
-        return MAXIMUM_CPU_UTILIZATION;
-    }
+    memory_limit_percent: u64,
+) -> ContainerMemoryPlan {
     let ranks = u64::from(tensor_parallel_size.max(1));
-    let per_node = estimate
+    // What the ranks may hold between them: the estimate with the configured slack, so a slightly
+    // low estimate does not fail and a runaway one is still killed.
+    let workers_share = estimate
         .required_bytes
-        .div_ceil(ranks)
-        .saturating_mul(CPU_UTILIZATION_SAFETY_NUMERATOR)
-        / CPU_UTILIZATION_SAFETY_DENOMINATOR;
+        .saturating_mul(memory_limit_percent.max(100))
+        / 100;
+    let limit_bytes = workers_share.saturating_add(STARTUP_RESERVE_BYTES);
 
-    let fraction = per_node as f64 / node_capacity_bytes as f64;
-    fraction.clamp(MINIMUM_CPU_UTILIZATION, MAXIMUM_CPU_UTILIZATION)
+    #[allow(clippy::cast_precision_loss)]
+    let utilization = if limit_bytes == 0 {
+        MAXIMUM_CPU_UTILIZATION
+    } else {
+        (workers_share as f64 / (limit_bytes as f64 * ranks as f64))
+            .clamp(MINIMUM_CPU_UTILIZATION, MAXIMUM_CPU_UTILIZATION)
+    };
+
+    ContainerMemoryPlan {
+        limit_bytes,
+        utilization,
+    }
 }
 
 /// A model is `Recommended` only when it leaves comfortable headroom; at 70% or more of the
@@ -393,82 +427,134 @@ mod tests {
     /// 125.94 GiB, which is half of the host's 251 GiB.
     const NODE_CAPACITY_BYTES: u64 = 135_236_616_192;
 
-    #[test]
-    fn reserves_a_node_fraction_sized_to_the_model_rather_than_the_host() {
-        // The default of 0.92 asks for 92% of a node and fails on an almost idle machine; that
-        // is the failure this exists to prevent.
-        let estimate = MemoryEstimate::compute(&qwen3_8b(), &shape(32_768, 2));
-        let utilization = cpu_memory_utilization(&estimate, 2, NODE_CAPACITY_BYTES);
+    /// What vLLM 0.26 reported on the Xeon at a 32.72 GiB ceiling, and what the engine already
+    /// held when it checked. Kept as constants because they are the only evidence for the formula.
+    const MEASURED_LIMIT_GIB: f64 = 32.72;
+    const MEASURED_WORKER_REQUEST_GIB: f64 = 11.11;
+    const MEASURED_UTILIZATION: f64 = 0.3396;
+    const MEASURED_RESIDENT_AT_STARTUP_GIB: f64 = 32.72 - 30.78;
 
-        assert!(utilization > 0.05, "{utilization}");
+    fn plan(geometry: &ModelGeometry, ranks: u32) -> ContainerMemoryPlan {
+        container_memory_plan(
+            &MemoryEstimate::compute(geometry, &shape(32_768, ranks)),
+            ranks,
+            115,
+        )
+    }
+
+    #[test]
+    fn the_fraction_is_of_the_container_limit_not_of_a_numa_node() {
+        // The arithmetic that identifies the denominator: 0.3396 x 32.72 GiB = 11.11 GiB. The
+        // NUMA node was 125.94 GiB, so it is not that.
+        let implied = MEASURED_UTILIZATION * MEASURED_LIMIT_GIB;
+
         assert!(
-            utilization < 0.3,
-            "an 8B model needs a small slice of a 135 GB node: {utilization}"
+            (implied - MEASURED_WORKER_REQUEST_GIB).abs() < 0.02,
+            "the container limit is the denominator: {implied} vs {MEASURED_WORKER_REQUEST_GIB}"
         );
     }
 
     #[test]
-    fn a_larger_model_reserves_a_larger_fraction() {
-        let small = cpu_memory_utilization(
-            &MemoryEstimate::compute(&qwen3_8b(), &shape(32_768, 2)),
-            2,
-            NODE_CAPACITY_BYTES,
-        );
-        let large = cpu_memory_utilization(
-            &MemoryEstimate::compute(&qwen3_30b_a3b(), &shape(32_768, 2)),
-            2,
-            NODE_CAPACITY_BYTES,
-        );
+    fn the_ranks_together_stay_inside_the_ceiling() {
+        // Each worker claims the fraction independently, so exceeding the ceiling here is an
+        // out-of-memory kill part-way through loading rather than a legible refusal.
+        for ranks in [1, 2, 4, 8] {
+            let plan = plan(&qwen3_30b_a3b(), ranks);
+            let reserved = plan.utilization * plan.limit_bytes as f64 * f64::from(ranks);
 
-        assert!(large > small, "small={small} large={large}");
+            assert!(
+                reserved <= plan.limit_bytes as f64,
+                "{ranks} ranks reserve {reserved} of a {} ceiling",
+                plan.limit_bytes
+            );
+        }
     }
 
     #[test]
-    fn more_ranks_reserve_less_of_each_node() {
-        // Each rank binds one node and holds only its shard.
-        let estimate = MemoryEstimate::compute(&qwen3_30b_a3b(), &shape(32_768, 2));
-        let one_rank = cpu_memory_utilization(&estimate, 1, NODE_CAPACITY_BYTES);
-        let two_ranks = cpu_memory_utilization(&estimate, 2, NODE_CAPACITY_BYTES);
+    fn the_ranks_together_still_cover_the_estimate() {
+        // The other side of the same constraint: too small a fraction and the key-value cache does
+        // not fit, which is how a healthy 4B model was left with 1.47 GiB where it needed 18.
+        for ranks in [1, 2, 4] {
+            let estimate = MemoryEstimate::compute(&qwen3_30b_a3b(), &shape(32_768, ranks));
+            let plan = container_memory_plan(&estimate, ranks, 115);
+            let reserved = plan.utilization * plan.limit_bytes as f64 * f64::from(ranks);
 
-        assert!(two_ranks < one_rank, "one={one_rank} two={two_ranks}");
+            assert!(
+                reserved >= estimate.required_bytes as f64,
+                "{ranks} ranks reserve {reserved} for an estimate of {}",
+                estimate.required_bytes
+            );
+        }
     }
 
     #[test]
-    fn never_asks_for_nearly_a_whole_node() {
-        // A model far larger than a node must still produce a request vLLM can satisfy against
-        // free memory rather than one guaranteed to be refused.
-        let enormous = MemoryEstimate::compute(&llama4_scout(), &shape(32_768, 1));
+    fn the_ceiling_leaves_room_for_what_is_resident_before_the_workers_start() {
+        // vLLM compares its request against available memory, not against the ceiling. If the
+        // workers' share were the whole ceiling, the launcher's own footprint would refuse it.
+        for ranks in [1, 2] {
+            for geometry in [qwen3_8b(), qwen3_30b_a3b()] {
+                let plan = plan(&geometry, ranks);
+                let per_worker = plan.utilization * plan.limit_bytes as f64;
+                let available =
+                    plan.limit_bytes as f64 - MEASURED_RESIDENT_AT_STARTUP_GIB * GIB as f64;
 
-        assert_eq!(
-            cpu_memory_utilization(&enormous, 1, NODE_CAPACITY_BYTES),
-            MAXIMUM_CPU_UTILIZATION
-        );
+                assert!(
+                    per_worker <= available,
+                    "a worker asks for {per_worker} where {available} is available"
+                );
+            }
+        }
     }
 
     #[test]
-    fn never_asks_for_a_sliver() {
+    fn a_small_model_gets_the_reserve_too() {
+        // A fractional headroom would give a 2 GB model 300 MB of slack, which does not cover a
+        // launcher measured at 1.94 GiB. The reserve is therefore absolute.
         let tiny = ModelGeometry {
-            total_parameters: 100_000_000,
-            weight_bytes: None,
-            active_parameters: 100_000_000,
+            total_parameters: 500_000_000,
+            weight_bytes: Some(1_000_000_000),
+            active_parameters: 500_000_000,
             ..qwen3_8b()
         };
-        let utilization = cpu_memory_utilization(
-            &MemoryEstimate::compute(&tiny, &shape(2_048, 1)),
-            1,
-            NODE_CAPACITY_BYTES,
-        );
+        let estimate = MemoryEstimate::compute(&tiny, &shape(2_048, 1));
+        let plan = container_memory_plan(&estimate, 1, 115);
 
-        assert!(utilization >= MINIMUM_CPU_UTILIZATION);
+        assert!(
+            plan.limit_bytes - (plan.utilization * plan.limit_bytes as f64) as u64
+                >= MEASURED_RESIDENT_AT_STARTUP_GIB as u64 * 1024 * 1024 * 1024,
+            "plan={plan:?}"
+        );
     }
 
     #[test]
-    fn falls_back_to_the_ceiling_when_node_capacity_is_unknown() {
-        let estimate = MemoryEstimate::compute(&qwen3_8b(), &shape(32_768, 2));
+    fn more_ranks_each_claim_less() {
+        assert!(plan(&qwen3_30b_a3b(), 1).utilization > plan(&qwen3_30b_a3b(), 2).utilization);
+    }
+
+    #[test]
+    fn never_claims_the_whole_ceiling() {
+        assert!(plan(&qwen3_8b(), 1).utilization <= MAXIMUM_CPU_UTILIZATION);
+    }
+
+    #[test]
+    fn never_claims_a_sliver() {
+        assert!(plan(&qwen3_8b(), 64).utilization >= MINIMUM_CPU_UTILIZATION);
+    }
+
+    #[test]
+    fn a_zero_rank_count_is_treated_as_one() {
+        assert_eq!(plan(&qwen3_8b(), 0), plan(&qwen3_8b(), 1));
+    }
+
+    #[test]
+    fn a_ceiling_below_the_estimate_is_raised_to_it() {
+        // A percentage under 100 would hand the engine less than the model needs, which is not a
+        // ceiling but a guaranteed failure.
+        let estimate = MemoryEstimate::compute(&qwen3_8b(), &shape(32_768, 1));
 
         assert_eq!(
-            cpu_memory_utilization(&estimate, 2, 0),
-            MAXIMUM_CPU_UTILIZATION
+            container_memory_plan(&estimate, 1, 50),
+            container_memory_plan(&estimate, 1, 100),
         );
     }
 

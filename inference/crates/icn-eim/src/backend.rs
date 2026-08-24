@@ -1,8 +1,20 @@
 //! `CompletionBackend` over a vLLM container's chat-completions endpoint.
 //!
-//! The trait is synchronous with an event callback, while the transport is async. `icn-api`
-//! invokes `complete` inside `tokio::task::spawn_blocking`, so blocking on a runtime handle
-//! here is correct: the caller is already on a blocking thread, not a runtime worker.
+//! The trait is synchronous with an event callback, while the transport is async, so the two are
+//! bridged by a channel: the request runs as a task on the runtime and hands decoded chunks back
+//! to the synchronous caller, which is the thread that invokes the callback.
+//!
+//! Not by blocking on a runtime handle, which is the obvious bridge and does not work. `icn-api`
+//! calls `complete` inside `tokio::task::spawn_blocking`, and a blocking task still carries the
+//! runtime context — that is what makes `Handle::current()` available there — so `block_on`
+//! panics with "cannot block the current thread from within a runtime". It did, on real hardware,
+//! after every unit and container test passed: the tests drive this backend directly and never
+//! through the API handler that owns the thread. A channel makes the question moot by never
+//! blocking a runtime thread at all.
+//!
+//! Backpressure is real rather than nominal. The queue is bounded and the task waits when it
+//! fills, so a consumer that stops reading stops the transport instead of accumulating a
+//! long generation in memory.
 //!
 //! ICN's previous out-of-process backend proxied length-prefixed JSON over a child process's
 //! stdio. This is the same architecture with a different transport — every value crossing the
@@ -30,6 +42,15 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Bounded so a runaway server cannot exhaust memory through a single frame.
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+/// Chunks that may sit between the transport task and the synchronous consumer.
+///
+/// Deep enough that ordinary token-by-token delivery never stalls, shallow enough that a consumer
+/// which stops reading cannot let a whole generation pile up.
+const STREAM_QUEUE_DEPTH: usize = 256;
+
+/// How long the transport waits before retrying a full queue.
+const BACKPRESSURE_PAUSE: Duration = Duration::from_millis(2);
 
 pub struct EimCompletionBackend {
     /// The serving-configuration identity ICN addresses this model by.
@@ -88,6 +109,7 @@ struct StreamState {
     cached_prompt_tokens: usize,
     generated_tokens: usize,
     finish_reason: Option<String>,
+    content_filter: ContentFilter,
     started_streaming: bool,
     first_token_at: Option<Instant>,
     last_token_at: Option<Instant>,
@@ -104,6 +126,7 @@ impl StreamState {
             cached_prompt_tokens: 0,
             generated_tokens: 0,
             finish_reason: None,
+            content_filter: ContentFilter::default(),
             started_streaming: false,
             first_token_at: None,
             last_token_at: None,
@@ -226,87 +249,59 @@ impl CompletionBackend for EimCompletionBackend {
             return Err(callback_error.unwrap_or(InferenceError::Cancelled));
         }
 
-        let transport = self.runtime.block_on(async {
-            let response = self
-                .client
-                .post(&url)
-                .timeout(self.request_timeout)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|error| InferenceError::Backend(format!("request failed: {error}")))?;
+        // Bounded, so a consumer that stops reading stops the transport rather than letting a
+        // long generation accumulate here.
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<StreamItem>(STREAM_QUEUE_DEPTH);
+        self.runtime.spawn(stream_completion(StreamRequest {
+            client: self.client.clone(),
+            url,
+            body,
+            served_model_name: self.served_model_name.clone(),
+            request_timeout: self.request_timeout,
+            cancelled: Arc::clone(&cancelled),
+            sender,
+        }));
 
-            let status = response.status();
-            if !status.is_success() {
-                let detail = response.text().await.unwrap_or_default();
-                let detail = detail.trim();
-                let detail = if detail.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {}", &detail[..detail.len().min(500)])
-                };
-                return Err(match status.as_u16() {
-                    // The container is up but does not serve this name. That is a
-                    // configuration mistake, not a transient failure.
-                    404 => InferenceError::InvalidConfig(format!(
-                        "served model `{}` is unknown to the container{detail}",
-                        self.served_model_name
-                    )),
-                    503 => InferenceError::Overloaded,
-                    _ => InferenceError::Backend(format!("HTTP {status}{detail}")),
-                });
-            }
-
-            let mut stream = response.bytes_stream();
-            let mut buffer: Vec<u8> = Vec::new();
-
-            while let Some(chunk) = stream.next().await {
-                if cancelled.load(Ordering::Relaxed) {
-                    return Err(InferenceError::Cancelled);
-                }
-                let chunk = chunk
-                    .map_err(|error| InferenceError::Backend(format!("stream failed: {error}")))?;
-                buffer.extend_from_slice(&chunk);
-                if buffer.len() > MAX_FRAME_BYTES {
-                    return Err(InferenceError::Backend(format!(
-                        "server-sent event frame exceeded {MAX_FRAME_BYTES} bytes"
-                    )));
-                }
-
-                while let Some((frame, consumed)) = next_sse_frame(&buffer) {
-                    buffer.drain(..consumed);
-                    let Some(payload) = sse_data(&frame) else {
-                        continue;
-                    };
-                    match decode_chunk(&payload) {
-                        Ok(ChunkOutcome::Done) => {
-                            state.saw_done = true;
-                        }
-                        Ok(ChunkOutcome::Error(message)) => {
-                            return Err(InferenceError::Backend(message));
-                        }
-                        Ok(ChunkOutcome::Chunk(chunk)) => {
-                            if !absorb(
-                                &chunk,
-                                &mut state,
-                                dispatched_at,
-                                timings_per_token,
-                                &mut emit,
-                                &mut callback_error,
-                            ) {
-                                return Err(InferenceError::Cancelled);
-                            }
-                        }
-                        Err(error) => {
-                            return Err(InferenceError::Backend(format!(
-                                "undecodable chunk: {error}"
-                            )));
-                        }
+        let mut transport = Ok(());
+        while let Ok(item) = receiver.recv() {
+            match item {
+                StreamItem::Chunk(chunk) => {
+                    if !absorb(
+                        &chunk,
+                        &mut state,
+                        dispatched_at,
+                        timings_per_token,
+                        &mut emit,
+                        &mut callback_error,
+                    ) {
+                        // The callback asked to stop. Dropping the receiver would also end the
+                        // transport, but setting the flag ends it at the next chunk boundary
+                        // instead of on the next send, which is one fewer request in flight.
+                        cancelled.store(true, Ordering::Relaxed);
+                        break;
                     }
                 }
+                StreamItem::Done => state.saw_done = true,
+                StreamItem::Ended(result) => {
+                    transport = result;
+                    break;
+                }
             }
-            Ok(())
-        });
+        }
+
+        // A stream that ended mid-delimiter left a partial marker held back. Releasing it is
+        // closer to the truth than discarding text the model produced.
+        if let Some(text) = state.content_filter.flush() {
+            state.text.push_str(&text);
+            let snapshot = timings_per_token.then(|| state.snapshot(state.metrics(dispatched_at)));
+            emit(
+                InferenceStreamEvent {
+                    delta: InferenceEvent::ContentDelta { text },
+                    timings: snapshot,
+                },
+                &mut callback_error,
+            );
+        }
 
         // A cancellation caused by the callback reports the callback's error, which carries
         // why the consumer stopped listening.
@@ -338,6 +333,218 @@ impl CompletionBackend for EimCompletionBackend {
 /// Applies one decoded chunk to the accumulated state, emitting events as it goes.
 ///
 /// Returns false when the consumer's callback asked to stop.
+/// Chat-template markers that delimit a tool call.
+///
+/// vLLM's streaming tool parsers strip the JSON payload but can pass the surrounding delimiter
+/// through as ordinary content when the model emits it as its own token. Observed on real hardware
+/// with `ibm-granite/granite-3.2-2b-instruct`: every tool-calling turn put a bare `<tool_call>` in
+/// the assistant's visible message while extracting the call correctly.
+const TOOL_CALL_DELIMITERS: &[&str] = &[
+    "<tool_call>",
+    "</tool_call>",
+    "<|tool_call|>",
+    "<tool_calls>",
+    "</tool_calls>",
+];
+
+/// Holds back content that might turn out to be a tool-call delimiter.
+///
+/// The delimiter arrives one token at a time — `<`, `tool`, `_`, `call`, `>` — so no single
+/// fragment ever equals it and per-fragment matching cannot work. This accumulates while what it
+/// holds is still a possible delimiter, drops it on a complete match, and releases it untouched the
+/// moment it becomes something else.
+///
+/// Nothing can be lost. Every held fragment is either emitted verbatim, in order, or was exactly a
+/// delimiter — so the filter can only ever remove a marker the model's template emitted, never
+/// prose it wrote.
+#[derive(Default)]
+struct ContentFilter {
+    held: String,
+}
+
+impl ContentFilter {
+    /// Takes one fragment and returns whatever is now safe to emit.
+    fn accept(&mut self, fragment: &str) -> Option<String> {
+        if self.held.is_empty() && !starts_a_delimiter(fragment) {
+            // The common case: ordinary prose never touches the buffer.
+            return (!fragment.is_empty()).then(|| fragment.to_owned());
+        }
+        self.held.push_str(fragment);
+        if TOOL_CALL_DELIMITERS.contains(&self.held.as_str()) {
+            self.held.clear();
+            return None;
+        }
+        if starts_a_delimiter(&self.held) {
+            return None;
+        }
+        Some(std::mem::take(&mut self.held))
+    }
+
+    /// Whatever is still held when the stream ends.
+    ///
+    /// A stream that stops mid-delimiter leaves a partial marker, which is closer to prose than to
+    /// scaffolding: the alternative is silently discarding text the model produced.
+    fn flush(&mut self) -> Option<String> {
+        (!self.held.is_empty()).then(|| std::mem::take(&mut self.held))
+    }
+}
+
+/// Whether this text is a strict prefix of some tool-call delimiter.
+fn starts_a_delimiter(text: &str) -> bool {
+    !text.is_empty()
+        && TOOL_CALL_DELIMITERS
+            .iter()
+            .any(|delimiter| delimiter.starts_with(text) && *delimiter != text)
+}
+
+/// One item crossing from the transport task to the synchronous consumer.
+enum StreamItem {
+    Chunk(Box<crate::sse::ChatChunk>),
+    /// The `[DONE]` sentinel.
+    Done,
+    /// Always the last item: how the transport finished.
+    Ended(Result<(), InferenceError>),
+}
+
+/// Everything the transport task owns.
+///
+/// By value rather than by reference: the task outlives the call that spawned it whenever the
+/// consumer stops early, so it cannot borrow from the caller's frame.
+struct StreamRequest {
+    client: reqwest::Client,
+    url: String,
+    body: serde_json::Value,
+    served_model_name: String,
+    request_timeout: Duration,
+    cancelled: Arc<AtomicBool>,
+    sender: std::sync::mpsc::SyncSender<StreamItem>,
+}
+
+/// Hands one item to the consumer, waiting if the queue is full.
+///
+/// Returns false once the consumer has gone away, which is the transport's signal to stop. The
+/// wait is a sleep rather than a blocking send because this runs on a runtime thread, and
+/// blocking one of those is the whole mistake this module exists to avoid.
+async fn offer(sender: &std::sync::mpsc::SyncSender<StreamItem>, item: StreamItem) -> bool {
+    use std::sync::mpsc::TrySendError;
+
+    let mut pending = item;
+    loop {
+        match sender.try_send(pending) {
+            Ok(()) => return true,
+            Err(TrySendError::Full(returned)) => {
+                pending = returned;
+                tokio::time::sleep(BACKPRESSURE_PAUSE).await;
+            }
+            Err(TrySendError::Disconnected(_)) => return false,
+        }
+    }
+}
+
+/// Runs one chat completion and streams its decoded chunks back.
+async fn stream_completion(request: StreamRequest) {
+    let StreamRequest {
+        client,
+        url,
+        body,
+        served_model_name,
+        request_timeout,
+        cancelled,
+        sender,
+    } = request;
+
+    let outcome = read_stream(
+        &client,
+        &url,
+        &body,
+        &served_model_name,
+        request_timeout,
+        &cancelled,
+        &sender,
+    )
+    .await;
+    // Best effort: a consumer that has already stopped does not need to be told why.
+    let _ = offer(&sender, StreamItem::Ended(outcome)).await;
+}
+
+async fn read_stream(
+    client: &reqwest::Client,
+    url: &str,
+    body: &serde_json::Value,
+    served_model_name: &str,
+    request_timeout: Duration,
+    cancelled: &Arc<AtomicBool>,
+    sender: &std::sync::mpsc::SyncSender<StreamItem>,
+) -> Result<(), InferenceError> {
+    let response = client
+        .post(url)
+        .timeout(request_timeout)
+        .json(body)
+        .send()
+        .await
+        .map_err(|error| InferenceError::Backend(format!("request failed: {error}")))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        let detail = detail.trim();
+        let detail = if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", &detail[..detail.len().min(500)])
+        };
+        return Err(match status.as_u16() {
+            // The container is up but does not serve this name. That is a configuration mistake,
+            // not a transient failure.
+            404 => InferenceError::InvalidConfig(format!(
+                "served model `{served_model_name}` is unknown to the container{detail}"
+            )),
+            503 => InferenceError::Overloaded,
+            _ => InferenceError::Backend(format!("HTTP {status}{detail}")),
+        });
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buffer: Vec<u8> = Vec::new();
+
+    while let Some(chunk) = stream.next().await {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(InferenceError::Cancelled);
+        }
+        let chunk =
+            chunk.map_err(|error| InferenceError::Backend(format!("stream failed: {error}")))?;
+        buffer.extend_from_slice(&chunk);
+        if buffer.len() > MAX_FRAME_BYTES {
+            return Err(InferenceError::Backend(format!(
+                "server-sent event frame exceeded {MAX_FRAME_BYTES} bytes"
+            )));
+        }
+
+        while let Some((frame, consumed)) = next_sse_frame(&buffer) {
+            buffer.drain(..consumed);
+            let Some(payload) = sse_data(&frame) else {
+                continue;
+            };
+            let item = match decode_chunk(&payload) {
+                Ok(ChunkOutcome::Done) => StreamItem::Done,
+                Ok(ChunkOutcome::Chunk(chunk)) => StreamItem::Chunk(Box::new(chunk)),
+                Ok(ChunkOutcome::Error(message)) => {
+                    return Err(InferenceError::Backend(message));
+                }
+                Err(error) => {
+                    return Err(InferenceError::Backend(format!(
+                        "undecodable chunk: {error}"
+                    )));
+                }
+            };
+            if !offer(sender, item).await {
+                return Err(InferenceError::Cancelled);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn absorb(
     chunk: &crate::sse::ChatChunk,
     state: &mut StreamState,
@@ -410,21 +617,24 @@ fn absorb(
         }
     }
 
-    if let Some(text) = &chunk.content {
-        state.text.push_str(text);
-        // Only counted when the server sent no usage; otherwise usage wins.
+    if let Some(fragment) = &chunk.content {
+        // Counted whether or not the fragment is emitted: a held delimiter token was still
+        // generated. Only counted at all when the server sent no usage; otherwise usage wins.
         if state.generated_tokens == 0 || chunk.usage.is_none() {
             state.generated_tokens = state.generated_tokens.saturating_add(1);
         }
-        let snapshot = timings(state);
-        if !emit(
-            InferenceStreamEvent {
-                delta: InferenceEvent::ContentDelta { text: text.clone() },
-                timings: snapshot,
-            },
-            callback_error,
-        ) {
-            return false;
+        if let Some(text) = state.content_filter.accept(fragment) {
+            state.text.push_str(&text);
+            let snapshot = timings(state);
+            if !emit(
+                InferenceStreamEvent {
+                    delta: InferenceEvent::ContentDelta { text },
+                    timings: snapshot,
+                },
+                callback_error,
+            ) {
+                return false;
+            }
         }
     }
 
@@ -702,6 +912,86 @@ mod tests {
         // Time to first token is measured, and prompt time is attributed to it.
         assert!(metrics.time_to_first_token_ms > 0.0);
         assert_eq!(metrics.prompt_ms, metrics.time_to_first_token_ms);
+    }
+
+    #[test]
+    fn a_delimiter_arriving_one_token_at_a_time_never_reaches_the_conversation() {
+        // Exactly what `ibm-granite/granite-3.2-2b-instruct` emits under vLLM's `granite` parser:
+        // the call is extracted correctly and the marker dribbles out as five content tokens. No
+        // single fragment equals the delimiter, which is why per-fragment matching cannot work.
+        let (state, events) = collect(
+            &[
+                content("<"),
+                content("tool"),
+                content("_"),
+                content("call"),
+                content(">"),
+            ],
+            false,
+        );
+
+        assert_eq!(state.text, "", "the marker is not part of what was said");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, InferenceEvent::ContentDelta { .. })),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn text_that_only_looks_like_a_delimiter_is_released_intact() {
+        // The buffer must be a delay, not a filter on prose: as soon as the sequence diverges,
+        // everything held has to come back out in order.
+        let (state, _) = collect(&[content("<"), content("think"), content("ing>")], false);
+
+        assert_eq!(state.text, "<thinking>");
+    }
+
+    #[test]
+    fn content_after_a_dropped_delimiter_still_arrives() {
+        let (state, _) = collect(
+            &[
+                content("<"),
+                content("tool_call>"),
+                content("Kraków"),
+                content(" it is."),
+            ],
+            false,
+        );
+
+        assert_eq!(state.text, "Kraków it is.");
+    }
+
+    #[test]
+    fn ordinary_prose_never_enters_the_buffer() {
+        let mut filter = ContentFilter::default();
+
+        assert_eq!(filter.accept("Kraków"), Some("Kraków".to_owned()));
+        assert!(filter.held.is_empty());
+    }
+
+    #[test]
+    fn a_stream_that_stops_mid_delimiter_releases_what_it_held() {
+        // Discarding it would silently drop text the model produced, which is the worse error of
+        // the two available.
+        let mut filter = ContentFilter::default();
+
+        assert_eq!(filter.accept("<tool"), None);
+        assert_eq!(filter.flush(), Some("<tool".to_owned()));
+        assert_eq!(filter.flush(), None, "flushing twice must not duplicate");
+    }
+
+    #[test]
+    fn a_complete_delimiter_is_dropped_rather_than_held() {
+        // `<tool_call>` is not a prefix of any longer delimiter, so it resolves immediately instead
+        // of waiting for a token that will never come.
+        let mut filter = ContentFilter::default();
+
+        for fragment in ["<", "tool", "_", "call", ">"] {
+            assert_eq!(filter.accept(fragment), None);
+        }
+        assert_eq!(filter.flush(), None);
     }
 
     #[test]

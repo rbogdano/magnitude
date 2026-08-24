@@ -76,14 +76,36 @@ docker build -f docker/Dockerfile.inference \
 Then start ICN with `--eim-catalog <table.json>`. Four things this will not forgive, all of them
 learned by watching a real vLLM refuse to start:
 
-- **`gpu-memory-utilization`** must be set. On the CPU backend that flag controls CPU memory and
-  defaults to 0.92 of every NUMA node, which fails on a host doing anything at all. The launch
-  contract derives it, so this only matters when running a container by hand.
+- **`gpu-memory-utilization`** must be set, and it is subtler than its name. On the CPU backend it
+  is a fraction of the *container's* memory limit, not of a NUMA node; every tensor-parallel worker
+  claims that fraction independently; and vLLM checks it against memory currently available rather
+  than against the limit. Running a container by hand with `--memory L` and a fraction picked for a
+  NUMA node gets you either `Available memory on node 0 ... is less than desired CPU memory
+  utilization` or a key-value cache far too small to hold the context. The launch contract derives
+  the limit and the fraction together, so this only matters by hand.
 - **`--shm-size`** must exceed Docker's 64 MB default whenever tensor parallelism is used. Without
   it vLLM's workers cannot broadcast and the only symptom is a gloo "connection closed by peer".
 - **`--cap-add SYS_NICE`** is what lets vLLM bind worker memory to a NUMA node.
-- **Proxy variables** must reach the container on a network without direct internet access.
-  Without them the weight download fails in a way that reads as a missing model.
+- **Proxy variables** must reach whatever downloads. Magnitude fetches weights in-process, so the
+  variables have to be in ICN's own environment — the Docker daemon's proxy configuration does not
+  reach it, and the resulting timeout reads like a Hugging Face outage.
 
-Weights are not preserved between containers unless the engine's Hugging Face cache is mounted;
-that is accepted behavior for now, so expect a re-download on every fresh container.
+## Installing a model
+
+Selecting a model should install and then serve it. Check the whole path rather than the ends:
+
+    curl -s -XPOST localhost:8080/v1/models/catalog/reconcile \
+      -H 'content-type: application/json' \
+      -d '{"modelId":"qwen-qwen3-4b","variantId":"vllm-bf16:tp1"}'
+
+The reply must be `DownloadAdmitted` and return immediately — a reply that blocks for the length of
+the download is the bug this shape exists to prevent. Then `GET /v1/models/downloads` should walk
+`resolving` (the image) into `downloading` with byte counts that move and a plausible transfer rate,
+and finish `Completed`. Afterwards `GET /v1/models` must report the model `Installed`, and the
+weights must be on disk as a plain repository copy at `<cache>/eim/model-cache/<org>/<model>/`.
+
+Two things worth confirming by eye, because both were wrong once. The container log should say
+`Found model in local directory format`, which is what proves the prefetch is being used rather than
+a second download happening invisibly inside the container. And a completion should stream through
+`POST /v1/chat/completions` — not just reach `Ready` — because the load path and the inference path
+fail independently, and a model that loads but cannot stream looks healthy in the snapshot.

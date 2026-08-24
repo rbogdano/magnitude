@@ -87,20 +87,22 @@ pub struct OwnedContainer {
 }
 
 impl OwnedContainer {
-    /// Whether this container belongs to a different, no-longer-running ICN.
+    /// Whether this container's owning process is gone.
     ///
-    /// Containers whose recorded pid is still alive are left alone even when the instance id
-    /// differs, because a second ICN may legitimately be running alongside this one.
+    /// Liveness is the only discriminator, and deliberately so. The instance id must not exempt a
+    /// container: ACN launches ICN with a *stable* identity, so a restarted ICN carries its
+    /// predecessor's instance id, and treating a matching id as proof of ownership made every
+    /// container survive an ICN that was killed rather than shut down. The next ICN then could not
+    /// start that model at all, because the container name is derived from the same identity and
+    /// collided — a permanent failure needing manual cleanup, reached by the ordinary path of the
+    /// client ending a session with `SIGKILL` after its grace period.
+    ///
+    /// A container recorded against our own pid is the one we are running. A live pid that is not
+    /// ours belongs to a second ICN alongside this one and is left alone.
     #[must_use]
-    pub fn is_orphan_of(
-        &self,
-        current_instance_id: &str,
-        pid_is_alive: impl Fn(u32) -> bool,
-    ) -> bool {
-        if self.icn_instance_id.as_deref() == Some(current_instance_id) {
-            return false;
-        }
+    pub fn is_orphan_of(&self, current_pid: u32, pid_is_alive: impl Fn(u32) -> bool) -> bool {
         match self.pid {
+            Some(pid) if pid == current_pid => false,
             Some(pid) => !pid_is_alive(pid),
             // No pid recorded means we cannot prove an owner is alive; treat it as an orphan.
             None => true,
@@ -146,16 +148,20 @@ mod tests {
         assert!(args.contains(&"dev.magnitude.eim-profile-id=vllm-xeon-bf16-tp2".to_owned()));
     }
 
+    /// The pid this ICN would record on a container it starts.
+    const OURS: u32 = 4242;
+
     #[test]
-    fn our_own_containers_are_never_orphans() {
+    fn the_container_we_are_running_is_never_an_orphan() {
         let container = OwnedContainer {
             id: "deadbeef".to_owned(),
             name: "magnitude-eim-icn-1-mi-1".to_owned(),
             icn_instance_id: Some("icn-1".to_owned()),
-            pid: Some(1),
+            pid: Some(OURS),
         };
 
-        assert!(!container.is_orphan_of("icn-1", |_| false));
+        // Even a liveness check that claims nothing is alive must not reach our own container.
+        assert!(!container.is_orphan_of(OURS, |_| false));
     }
 
     #[test]
@@ -167,9 +173,28 @@ mod tests {
             pid: Some(999_999),
         };
 
-        assert!(container.is_orphan_of("icn-1", |_| false));
+        assert!(container.is_orphan_of(OURS, |_| false));
         // A second ICN that is still running owns its containers; leave them alone.
-        assert!(!container.is_orphan_of("icn-1", |_| true));
+        assert!(!container.is_orphan_of(OURS, |_| true));
+    }
+
+    #[test]
+    fn a_restarted_icn_reclaims_its_predecessors_containers() {
+        // The identity is stable across restarts because ACN supplies it, so the predecessor's
+        // container carries *our* instance id with a dead pid. Exempting it on the matching id
+        // left the name permanently taken and the model unservable -- reached by the ordinary path
+        // of a client killing ICN after its shutdown grace period.
+        let container = OwnedContainer {
+            id: "deadbeef".to_owned(),
+            name: "magnitude-eim-icn-1-mi-1".to_owned(),
+            icn_instance_id: Some("icn-1".to_owned()),
+            pid: Some(999_999),
+        };
+
+        assert!(
+            container.is_orphan_of(OURS, |_| false),
+            "a matching instance id is not proof that an owner is alive"
+        );
     }
 
     #[test]
@@ -181,6 +206,6 @@ mod tests {
             pid: None,
         };
 
-        assert!(container.is_orphan_of("icn-1", |_| true));
+        assert!(container.is_orphan_of(OURS, |_| true));
     }
 }

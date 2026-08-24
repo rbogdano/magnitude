@@ -31,63 +31,24 @@ use icn_contracts::models::{
     ResolvedServableModelBundle, StartModelDownloadRequest, StartModelDownloadResponse,
 };
 
+use crate::acquisition::CatalogAcquisition;
 use crate::controller::EimModelDefinition;
 
 /// Serves the catalog from the model table.
 pub struct EimCatalog {
     definitions: Arc<BTreeMap<ModelServingConfigurationId, EimModelDefinition>>,
-    packages: Arc<dyn InstalledImageProbe>,
-}
-
-/// Whether a model's serving image is present locally.
-///
-/// Abstracted so the projection is testable without a daemon, and because "installed" will grow
-/// to mean image *and* cached weights once acquisition lands.
-pub trait InstalledImageProbe: Send + Sync + 'static {
-    fn is_installed(&self, image: &str) -> BoxFuture<'_, bool>;
-}
-
-/// Reports nothing as installed. Used before acquisition exists and in tests.
-pub struct NoImagesInstalled;
-
-impl InstalledImageProbe for NoImagesInstalled {
-    fn is_installed(&self, _image: &str) -> BoxFuture<'_, bool> {
-        Box::pin(async { false })
-    }
-}
-
-/// Asks Docker whether the serving image is present.
-pub struct DockerImageProbe {
-    docker: crate::docker::DockerCli,
-}
-
-impl DockerImageProbe {
-    #[must_use]
-    pub fn new(docker: crate::docker::DockerCli) -> Self {
-        Self { docker }
-    }
-}
-
-impl InstalledImageProbe for DockerImageProbe {
-    fn is_installed(&self, image: &str) -> BoxFuture<'_, bool> {
-        let image = image.to_owned();
-        Box::pin(async move {
-            // A failed inspect means absent, not an error: the client asks constantly and a
-            // transient daemon hiccup should not surface as a catalog failure.
-            matches!(self.docker.image_summary(&image).await, Ok(Some(_)))
-        })
-    }
+    acquisition: Arc<dyn CatalogAcquisition>,
 }
 
 impl EimCatalog {
     #[must_use]
     pub fn new(
         definitions: Arc<BTreeMap<ModelServingConfigurationId, EimModelDefinition>>,
-        packages: Arc<dyn InstalledImageProbe>,
+        acquisition: Arc<dyn CatalogAcquisition>,
     ) -> Self {
         Self {
             definitions,
-            packages,
+            acquisition,
         }
     }
 
@@ -275,7 +236,7 @@ impl CatalogModels for EimCatalog {
             let mut catalog_models = Vec::new();
             let mut diagnostics = Vec::new();
             for definition in self.definitions.values() {
-                let installed = self.packages.is_installed(&definition.image).await;
+                let installed = self.acquisition.is_installed(definition).await;
                 match Self::entry(definition, installed) {
                     Ok(model) => catalog_models.push(model),
                     // A malformed entry is reported rather than dropped, so a typo in the table
@@ -296,18 +257,39 @@ impl CatalogModels for EimCatalog {
         })
     }
 
+    /// Installs a model, or reports it as already current.
+    ///
+    /// Never blocks on the work. Preparing a serving image and fetching tens of gigabytes of
+    /// weights takes minutes, and holding an HTTP request open for that long would give the
+    /// client neither progress nor a way to cancel — so the reply is an admitted download and the
+    /// client follows it on the surface built for exactly that.
     fn reconcile(
         &self,
         request: ReconcileCatalogModelRequest,
     ) -> BoxFuture<'_, Result<ReconcileCatalogModelResponse, InventoryError>> {
         Box::pin(async move {
-            // Acquisition -- building or pulling the image and prefetching weights -- is not
-            // implemented yet. Refusing explicitly is better than reporting an admitted download
-            // that will never progress, which the client would wait on indefinitely.
-            Err(InventoryError::Unsupported(format!(
-                "installing {}/{} is not implemented for container-backed models yet",
-                request.model_id.0, request.variant_id.0
-            )))
+            let definition = self
+                .definitions
+                .values()
+                .find(|definition| {
+                    definition.catalog_model_id == request.model_id.0
+                        && definition.catalog_variant_id == request.variant_id.0
+                })
+                .ok_or_else(|| {
+                    InventoryError::NotFound(format!(
+                        "{}/{}",
+                        request.model_id.0, request.variant_id.0
+                    ))
+                })?;
+
+            if self.acquisition.is_installed(definition).await {
+                // The image digest is the version, so a present installation is by construction
+                // the version the table asked for. There is nothing to upgrade to.
+                return Ok(ReconcileCatalogModelResponse::Current);
+            }
+
+            let download_id = self.acquisition.begin(definition).await?;
+            Ok(ReconcileCatalogModelResponse::DownloadAdmitted { download_id })
         })
     }
 }
@@ -315,6 +297,7 @@ impl CatalogModels for EimCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acquisition::NoAcquisition;
     use crate::estimate::ModelGeometry;
     use crate::properties::ReasoningDeclaration;
     use icn_contracts::ModelModalities;
@@ -368,8 +351,86 @@ mod tests {
                     .map(|definition| (definition.configuration_id.clone(), definition))
                     .collect(),
             ),
-            Arc::new(NoImagesInstalled),
+            Arc::new(NoAcquisition),
         )
+    }
+
+    /// Reports everything installed, and records what installation was asked for.
+    struct AllInstalled {
+        requested: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl AllInstalled {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                requested: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl CatalogAcquisition for AllInstalled {
+        fn is_installed<'a>(&'a self, _definition: &'a EimModelDefinition) -> BoxFuture<'a, bool> {
+            Box::pin(async { true })
+        }
+
+        fn begin<'a>(
+            &'a self,
+            definition: &'a EimModelDefinition,
+        ) -> BoxFuture<'a, Result<ModelDownloadId, InventoryError>> {
+            Box::pin(async move {
+                self.requested
+                    .lock()
+                    .expect("requested")
+                    .push(definition.canonical_name.clone());
+                Ok(ModelDownloadId("download-1".to_owned()))
+            })
+        }
+
+        fn remove<'a>(
+            &'a self,
+            _definition: &'a EimModelDefinition,
+        ) -> BoxFuture<'a, Result<(), InventoryError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Reports nothing installed, and records what installation was asked for.
+    struct NoneInstalled {
+        requested: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl NoneInstalled {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                requested: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl CatalogAcquisition for NoneInstalled {
+        fn is_installed<'a>(&'a self, _definition: &'a EimModelDefinition) -> BoxFuture<'a, bool> {
+            Box::pin(async { false })
+        }
+
+        fn begin<'a>(
+            &'a self,
+            definition: &'a EimModelDefinition,
+        ) -> BoxFuture<'a, Result<ModelDownloadId, InventoryError>> {
+            Box::pin(async move {
+                self.requested
+                    .lock()
+                    .expect("requested")
+                    .push(definition.canonical_name.clone());
+                Ok(ModelDownloadId("download-1".to_owned()))
+            })
+        }
+
+        fn remove<'a>(
+            &'a self,
+            _definition: &'a EimModelDefinition,
+        ) -> BoxFuture<'a, Result<(), InventoryError>> {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     #[tokio::test]
@@ -569,19 +630,12 @@ mod tests {
 
     #[tokio::test]
     async fn reports_a_present_image_as_installed_and_current() {
-        struct AllInstalled;
-        impl InstalledImageProbe for AllInstalled {
-            fn is_installed(&self, _image: &str) -> BoxFuture<'_, bool> {
-                Box::pin(async { true })
-            }
-        }
-
         let catalog = EimCatalog::new(
             Arc::new(BTreeMap::from([(
                 definition().configuration_id,
                 definition(),
             )])),
-            Arc::new(AllInstalled),
+            AllInstalled::new(),
         );
         let response = catalog.list().await.expect("a catalog");
 
@@ -599,18 +653,12 @@ mod tests {
 
     #[tokio::test]
     async fn both_surfaces_describe_an_installed_model_identically() {
-        struct AllInstalled;
-        impl InstalledImageProbe for AllInstalled {
-            fn is_installed(&self, _image: &str) -> BoxFuture<'_, bool> {
-                Box::pin(async { true })
-            }
-        }
         let catalog = EimCatalog::new(
             Arc::new(BTreeMap::from([(
                 definition().configuration_id,
                 definition(),
             )])),
-            Arc::new(AllInstalled),
+            AllInstalled::new(),
         );
 
         let from_catalog = match &catalog.list().await.expect("a catalog").catalog_models[0]
@@ -632,16 +680,81 @@ mod tests {
         assert_eq!(from_catalog[0].package.id, definition().package_id);
     }
 
+    fn request() -> ReconcileCatalogModelRequest {
+        ReconcileCatalogModelRequest {
+            model_id: CatalogModelId("qwen-qwen3-8b".to_owned()),
+            variant_id: CatalogVariantId("vllm-bf16:tp2".to_owned()),
+        }
+    }
+
     #[tokio::test]
-    async fn refuses_installation_explicitly_instead_of_admitting_it() {
-        // Reporting an admitted download that never progresses would leave the client waiting.
+    async fn installing_an_absent_model_admits_a_download() {
+        let acquisition = NoneInstalled::new();
+        let catalog = EimCatalog::new(
+            Arc::new(BTreeMap::from([(
+                definition().configuration_id,
+                definition(),
+            )])),
+            Arc::clone(&acquisition) as Arc<dyn CatalogAcquisition>,
+        );
+
+        let admission = catalog.reconcile(request()).await.expect("an admission");
+
+        // A download rather than a blocking reply: this step is a multi-gigabyte fetch, and the
+        // download surface is the only one that carries progress and cancellation.
+        match admission {
+            ReconcileCatalogModelResponse::DownloadAdmitted { download_id } => {
+                assert_eq!(download_id.0, "download-1");
+            }
+            other => panic!("expected an admitted download, got {other:?}"),
+        }
+        assert_eq!(
+            *acquisition.requested.lock().expect("requested"),
+            vec!["Qwen/Qwen3-8B".to_owned()],
+            "the admission must actually have started the installation"
+        );
+    }
+
+    #[tokio::test]
+    async fn installing_a_model_that_is_already_there_starts_nothing() {
+        let acquisition = AllInstalled::new();
+        let catalog = EimCatalog::new(
+            Arc::new(BTreeMap::from([(
+                definition().configuration_id,
+                definition(),
+            )])),
+            Arc::clone(&acquisition) as Arc<dyn CatalogAcquisition>,
+        );
+
+        let admission = catalog.reconcile(request()).await.expect("an admission");
+
+        assert!(matches!(admission, ReconcileCatalogModelResponse::Current));
+        // Re-fetching weights that are already present would be the client's routine
+        // reconciliation destroying tens of gigabytes of work.
+        assert!(acquisition.requested.lock().expect("requested").is_empty());
+    }
+
+    #[tokio::test]
+    async fn installing_a_model_that_is_not_in_the_table_is_not_found() {
         let error = catalog(vec![definition()])
             .reconcile(ReconcileCatalogModelRequest {
-                model_id: CatalogModelId("qwen-qwen3-8b".to_owned()),
+                model_id: CatalogModelId("not-a-model".to_owned()),
                 variant_id: CatalogVariantId("vllm-bf16:tp2".to_owned()),
             })
             .await
-            .expect_err("installation is not implemented yet");
+            .expect_err("no such model");
+
+        assert!(matches!(error, InventoryError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn a_host_with_no_container_runtime_refuses_rather_than_stalling() {
+        // `NoAcquisition` is the `--fake` path. Admitting a download nothing will progress would
+        // leave the client waiting forever; the refusal is what lets it report the reason.
+        let error = catalog(vec![definition()])
+            .reconcile(request())
+            .await
+            .expect_err("nothing can install here");
 
         assert!(matches!(error, InventoryError::Unsupported(_)));
     }
@@ -705,7 +818,7 @@ impl InstalledModelPackages for EimCatalog {
         Box::pin(async move {
             let mut packages = Vec::new();
             for definition in self.definitions.values() {
-                if !self.packages.is_installed(&definition.image).await {
+                if !self.acquisition.is_installed(definition).await {
                     continue;
                 }
                 packages.push(Self::installed_package(definition));
@@ -746,36 +859,80 @@ impl InstalledModelPackages for EimCatalog {
     }
 }
 
-/// Downloads, which do not exist yet.
+/// The download surface, reporting the installations `reconcile` admitted.
 ///
-/// The endpoint still has to answer: ACN polls it while building its layer graph and treats an
-/// error as fatal. An empty list is truthful -- nothing is downloading -- while starting one is
-/// refused explicitly rather than admitted and left to stall.
-pub struct EimDownloads;
+/// The endpoint is not optional: ACN polls it while building its layer graph and treats an error
+/// as fatal. What it carries is the whole of what installing a container-backed model means —
+/// preparing the serving image, then fetching the weights with real byte counters, which is the
+/// only place that step can be given a progress bar the user can watch.
+pub struct EimDownloads {
+    acquisitions: Arc<crate::acquisition::EimAcquisitions>,
+    definitions: Arc<BTreeMap<ModelServingConfigurationId, EimModelDefinition>>,
+}
+
+impl EimDownloads {
+    #[must_use]
+    pub fn new(
+        acquisitions: Arc<crate::acquisition::EimAcquisitions>,
+        definitions: Arc<BTreeMap<ModelServingConfigurationId, EimModelDefinition>>,
+    ) -> Self {
+        Self {
+            acquisitions,
+            definitions,
+        }
+    }
+}
 
 impl ModelDownloads for EimDownloads {
+    /// Starts a download addressed by bundle rather than by catalog identity.
+    ///
+    /// The client reaches this path when it drives acquisition directly instead of through a
+    /// catalog reconciliation. Both end in the same registry, so a model already installing is
+    /// joined rather than started twice.
     fn start(
         &self,
-        _request: StartModelDownloadRequest,
+        request: StartModelDownloadRequest,
     ) -> BoxFuture<'_, Result<StartModelDownloadResponse, InventoryError>> {
-        Box::pin(async {
-            Err(InventoryError::Unsupported(
-                "weight prefetching is not implemented for container-backed models yet".to_owned(),
-            ))
+        Box::pin(async move {
+            let package_ids = match &request.bundle {
+                ServableModelBundle::Standalone { package } => vec![package.id.clone()],
+                _ => Vec::new(),
+            };
+            let definition = self
+                .definitions
+                .values()
+                .find(|definition| package_ids.contains(&definition.package_id))
+                .ok_or_else(|| {
+                    InventoryError::NotFound(
+                        package_ids
+                            .first()
+                            .map(|id| id.0.clone())
+                            .unwrap_or_else(|| "unknown bundle".to_owned()),
+                    )
+                })?;
+
+            let id = self.acquisitions.begin(definition);
+            Ok(StartModelDownloadResponse {
+                download: self
+                    .acquisitions
+                    .list()
+                    .into_iter()
+                    .find(|download| download.id == id),
+            })
         })
     }
 
     fn list(&self) -> BoxFuture<'_, Result<ModelDownloadsResponse, InventoryError>> {
-        Box::pin(async {
+        Box::pin(async move {
             Ok(ModelDownloadsResponse {
-                downloads: Vec::new(),
+                downloads: self.acquisitions.list(),
             })
         })
     }
 
     fn cancel(&self, id: &ModelDownloadId) -> BoxFuture<'_, Result<ModelDownload, InventoryError>> {
         let id = id.clone();
-        Box::pin(async move { Err(InventoryError::NotFound(id.0)) })
+        Box::pin(async move { self.acquisitions.cancel(&id) })
     }
 
     fn acknowledge_failure(
@@ -783,6 +940,6 @@ impl ModelDownloads for EimDownloads {
         id: &ModelDownloadId,
     ) -> BoxFuture<'_, Result<ModelDownload, InventoryError>> {
         let id = id.clone();
-        Box::pin(async move { Err(InventoryError::NotFound(id.0)) })
+        Box::pin(async move { self.acquisitions.acknowledge_failure(&id) })
     }
 }

@@ -68,7 +68,17 @@ ICN runtime control, and generation streams through ICN chat.
 
 ## Weights
 
-Weights are not managed by Magnitude yet. A model absent from the mounted cache is downloaded by the
-engine inside the container, which means a fresh container downloads it again — accepted for now, and
-the reason installing a model through the catalog is refused explicitly rather than admitted and left
-to stall.
+Magnitude fetches weights itself, into the layout EIM resolves a model identifier against:
+`<cache>/<org>/<model>/`, a plain copy of the Hugging Face repository. Installing a model prepares
+its serving image and then fetches those files, reported through the download surface with real
+byte counts, transfer rate and cancellation.
+
+The container therefore needs no network, and its weight cache mounts read-only, which is also what
+makes one cache safely shareable across container restarts. A model is installed only when both
+halves are present — the image and every recorded weight file at its recorded size — because either
+alone yields a container that cannot serve.
+
+Files that would be fetched twice are skipped: several repositories publish the same parameters in a
+second framework's format, which for `openai/gpt-oss-20b` is 27 GB of the 41 GB listed. Anything
+unrecognised is kept, since a spare configuration file costs nothing and a missing one fails a load
+without saying why.

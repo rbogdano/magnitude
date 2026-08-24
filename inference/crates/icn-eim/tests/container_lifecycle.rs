@@ -20,14 +20,22 @@ use icn_contracts::models::{
     ServableModelBundle, ServingProfile,
 };
 use icn_contracts::{
-    ChatMessage, ChatRequest, ChatRole, ChatTemplateRequest, InferenceEvent, ReasoningControl,
-    ResponseFormat, ToolChoice,
+    ChatMessage, ChatRequest, ChatRole, ChatTemplateRequest, InferenceError, InferenceEvent,
+    ReasoningControl, ResponseFormat, ToolChoice,
 };
 use icn_eim::controller::{EimControllerConfig, EimModelDefinition, EimModelInstanceController};
 use icn_eim::docker::DockerCli;
 use icn_eim::estimate::ModelGeometry;
 use icn_eim::properties::ReasoningDeclaration;
 use icn_eim::readiness::ReadinessConfig;
+
+/// Serializes the suite against the one Docker daemon it shares.
+///
+/// Every test here enumerates containers by the same owner label, so a test removing one while
+/// another lists them makes `docker ps` fail outright -- observed as
+/// `rw layer snapshot not found for container ...`, which reads exactly like a product bug and is
+/// not one. Cargo runs tests in a thread pool by default, so the exclusion has to be explicit.
+static DAEMON: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn stub_image() -> Option<String> {
     std::env::var("MAGNITUDE_EIM_STUB_IMAGE")
@@ -145,8 +153,9 @@ async fn cleanup(controller: &EimModelInstanceController) {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn loads_a_container_and_streams_a_completion() {
+    let _daemon = DAEMON.lock().await;
     let Some(image) = stub_image() else {
         eprintln!("skipped: set MAGNITUDE_EIM_STUB_IMAGE to run this");
         return;
@@ -213,9 +222,24 @@ async fn loads_a_container_and_streams_a_completion() {
 
     let backend = lease.backend().clone();
     let mut events = Vec::new();
+    // The callback does what `icn-api`'s does: a blocking send into the channel feeding the
+    // client's event stream. That call panics inside an async context, so a backend that bridges
+    // to its transport by entering one fails here rather than only on real hardware -- which is
+    // exactly what happened when the callback in this test merely pushed to a vector.
+    let (relay, mut relayed) = tokio::sync::mpsc::channel::<InferenceEvent>(8);
+    let drain = tokio::spawn(async move {
+        let mut count = 0usize;
+        while relayed.recv().await.is_some() {
+            count += 1;
+        }
+        count
+    });
     let generation = tokio::task::spawn_blocking(move || {
         backend
             .complete(chat_request(), &mut |event| {
+                relay
+                    .blocking_send(event.delta.clone())
+                    .map_err(|error| InferenceError::Callback(error.to_string()))?;
                 events.push(event.delta);
                 Ok(())
             })
@@ -223,6 +247,7 @@ async fn loads_a_container_and_streams_a_completion() {
     })
     .await
     .expect("blocking task");
+    let relayed_count = drain.await.expect("relay");
 
     cleanup(&controller).await;
 
@@ -248,6 +273,11 @@ async fn loads_a_container_and_streams_a_completion() {
         .position(|event| matches!(event, InferenceEvent::ContentDelta { .. }))
         .expect("a content delta");
     assert!(stream_start < first_delta, "{events:?}");
+    assert_eq!(
+        relayed_count,
+        events.len(),
+        "every event reached a consumer that blocks to receive it"
+    );
     assert_eq!(
         events
             .iter()
@@ -282,6 +312,7 @@ fn chat_request() -> ChatRequest {
 
 #[tokio::test]
 async fn replacing_a_model_terminalizes_the_previous_instance() {
+    let _daemon = DAEMON.lock().await;
     let Some(image) = stub_image() else {
         eprintln!("skipped: set MAGNITUDE_EIM_STUB_IMAGE to run this");
         return;
@@ -326,6 +357,7 @@ async fn replacing_a_model_terminalizes_the_previous_instance() {
 
 #[tokio::test]
 async fn a_container_that_fails_to_start_is_classified_from_its_log() {
+    let _daemon = DAEMON.lock().await;
     let Some(image) = stub_image() else {
         eprintln!("skipped: set MAGNITUDE_EIM_STUB_IMAGE to run this");
         return;
@@ -376,6 +408,7 @@ async fn a_container_that_fails_to_start_is_classified_from_its_log() {
 
 #[tokio::test]
 async fn stopping_a_ready_instance_removes_its_container() {
+    let _daemon = DAEMON.lock().await;
     let Some(image) = stub_image() else {
         eprintln!("skipped: set MAGNITUDE_EIM_STUB_IMAGE to run this");
         return;

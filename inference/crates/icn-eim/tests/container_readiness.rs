@@ -5,6 +5,10 @@
 //! plain `python:3.12-slim` is enough — the point is to exercise `docker run`, the readiness
 //! loop, state short-circuiting, and teardown against the real daemon, not to run vLLM.
 //!
+//! It must be plain, and `eim/stub` will not do: the server is inlined below and passed as the
+//! container's command, which that image's own entrypoint overrides. Naming it here would silently
+//! run a different server and fail on the served name.
+//!
 //!   MAGNITUDE_EIM_TEST_IMAGE=python:3.12-slim cargo test -p icn-eim --test container_readiness
 //!
 //! Every container it creates carries the ICN owner label and is removed on the way out, so a
@@ -232,9 +236,11 @@ async fn labels_every_container_so_the_reaper_can_find_it() {
     assert_eq!(ours.icn_instance_id.as_deref(), Some("integration-test"));
     assert_eq!(ours.pid, Some(std::process::id()));
     // A container belonging to this very process is never an orphan.
-    assert!(!ours.is_orphan_of("integration-test", |_| false));
-    // One belonging to a different, dead ICN is.
-    assert!(ours.is_orphan_of("some-other-icn", |_| false));
+    assert!(!ours.is_orphan_of(std::process::id(), |_| false));
+    // The same container seen by a *successor* process is one, because its owner is gone. This is
+    // the ordinary restart case, and exempting it on the matching instance id left the container
+    // name permanently taken.
+    assert!(ours.is_orphan_of(std::process::id() + 1, |_| false));
     assert!(
         !OWNER_LABEL.is_empty() && !OWNER_VALUE.is_empty(),
         "owner label constants must be set"

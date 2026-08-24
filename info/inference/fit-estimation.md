@@ -16,11 +16,16 @@ weights, key-value cache, activations, and runtime overhead. For a mixture of ex
 counts toward weights, because all of them stay resident, while only the active parameters bear on
 throughput.
 
-The estimate is not what limits the engine. vLLM's CPU backend reserves a fraction of each NUMA node
-rather than an absolute size, through a flag misleadingly named `--gpu-memory-utilization`, and that
-reservation is what decides whether a container starts. ICN derives it from the estimate. The two are
-distinct quantities and conflating them produces a container that either refuses to start or runs
-out of memory part-way through loading.
+The estimate is not what limits the engine. That is `--gpu-memory-utilization`, misleadingly named
+on the CPU backend, where it is a fraction of the memory the *container* may use rather than of a
+NUMA node — and each tensor-parallel worker claims that fraction independently. vLLM also compares
+the request against memory currently available rather than against the ceiling, so the ceiling has
+to exceed the workers' share by whatever is already resident.
+
+ICN therefore derives the container's memory ceiling and that fraction together from one estimate,
+because they multiply. Setting either from the estimate alone produces a container that refuses to
+start or runs out of memory part-way through loading; both mistakes were made before they were
+measured.
 
 On a host with plenty of memory the assessment is informational far more often than it is a gate. Its
 value is in what it shows the user before a multi-gigabyte download begins, so the buckets are

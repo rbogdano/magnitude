@@ -39,16 +39,47 @@ Canonical lifecycle lives in the instance snapshot, never in the load stream. Th
 stream for progress and discards it, so an instance is registered as Loading *before* its container
 starts — a client that only polls must still observe every transition.
 
+## Weights are fetched by Magnitude, not by the container
+
+EIM resolves `INFERENCE_MODEL_ID` against `<cache>/<org>/<model>/` before asking the engine to
+download, and calls that layout an explicit, pre-populated one. It is a plain copy of the
+repository's files, so Magnitude populates it over ordinary HTTP and the container never reaches
+the network.
+
+That is where the progress bar comes from. Installing is the longest step in serving a model for
+the first time, and the client's download surface is the only place that carries
+`completedBytes`/`totalBytes`/`bytesPerSecond`. Letting the engine download instead leaves the
+longest phase of the longest operation with nothing to show, no way to cancel, and a fresh
+download for every container.
+
+Selection is a denylist. A repository's non-weight files are kilobytes, so keeping an unrecognised
+one costs nothing while omitting a needed one fails a load for no visible reason. What the denylist
+is for is duplicate weights: `openai/gpt-oss-20b` publishes the same parameters three times and
+`mistralai/Mistral-7B-Instruct-v0.2` twice, which is 27 GB and 15 GB of waste respectively.
+
+Installed therefore means both halves — the serving image is present *and* the weights are
+complete against a recorded manifest. Either alone yields a container that cannot serve.
+
 ## Memory is estimated, and vLLM's own control is separate
 
 Fit is computed from six geometry numbers per model, not measured. Weights are charged at their
 measured on-disk size when known, because a published checkpoint is not always bf16, and for a
 mixture of experts every expert is resident even though few are active per token.
 
-The estimate is not what governs the engine's allocation. vLLM's CPU backend reserves a *fraction of
-each NUMA node* through `--gpu-memory-utilization`, misleadingly named on that backend, and defaults
-to 0.92 — which fails on a host doing anything at all. That reservation is derived from the estimate
-and is the value that decides whether a container starts. The two quantities must not be conflated.
+The estimate is not what governs the engine's allocation. That is `--gpu-memory-utilization`,
+misleadingly named on the CPU backend, and it interacts with the container's memory ceiling in
+three ways that were each established by watching a load fail:
+
+- The fraction is of the **container's cgroup limit**, not of a NUMA node. Reading it as a node
+  fraction while the cgroup is far smaller shrinks the real budget by the ratio between them.
+- **Each** tensor-parallel worker claims that fraction independently, so the reservation across the
+  container is `utilization x limit x ranks`. Ignoring the multiplication overcommits the cgroup.
+- The check is against memory *currently available*, not against the ceiling, so the ceiling must
+  exceed the workers' share by whatever the interpreter and EIM's launcher already hold.
+
+Because the two multiply, they are derived together from one estimate and never set independently:
+the ceiling is the estimate with its slack plus a fixed startup reserve, and the fraction hands the
+ranks the part that is not the reserve.
 
 On a large host the estimate is informational far more often than it is a gate. Its value is
 therefore in what it displays, which is why the four memory buckets — weights, KV cache,
@@ -120,11 +151,36 @@ configuration mistake is not.
   waiting out the readiness budget.
 - Stopping an instance removes its container, and a restarted ICN reaps what a killed predecessor
   left behind.
+- Selecting any listed, serveable model installs it and then serves it: the image is prepared, the
+  weights are fetched with byte-accurate progress, and the model reaches Ready.
+- Uninstalling reclaims the weights as well as the image.
+- The completion callback is invoked outside any async context, and a test proves it by blocking in
+  the callback the way the API handler does.
 - The served model name is read from `GET /v1/models` rather than assumed from any identifier.
+
+## The synchronous seam is bridged by a channel, not by blocking
+
+`CompletionBackend::complete` is synchronous with an event callback while the transport is async.
+The bridge is a bounded channel: the request runs as a task on the runtime and hands decoded chunks
+to the synchronous caller, which is the thread that invokes the callback.
+
+Not `Handle::block_on`, which is the obvious bridge and is wrong. It establishes an async context
+on the calling thread, and the callback `icn-api` supplies performs a blocking send into the
+client's event channel — which panics inside an async context. Every unit and container test passed
+while this was broken, because their callbacks only appended to a vector. The suite now supplies a
+callback that blocks exactly as the real one does.
 
 ## Not yet implemented
 
-Weight prefetching does not exist, and installing a model through the catalog is refused explicitly
-rather than admitted and left to stall. A model absent from the mounted cache is downloaded by the
-engine into the container, and is therefore downloaded again for each fresh container — accepted for
-now. Only Qwen3's tool-call parser has been confirmed on real hardware.
+Two of the six serveable models have had their tool-call parser confirmed on real hardware, Qwen3
+and Granite. The remaining four are still claims.
+
+Granite is worth recording because it shows how the claim can be wrong in more than one direction.
+`granite` extracts its calls correctly but leaks the `<tool_call>` marker into the visible message,
+one token at a time; `hermes` keeps the message clean and *corrupts the arguments*, because Granite
+3.2 wraps its call in a list that parser mis-slices. Corrupt arguments are the worse failure, so
+`granite` is the entry and the leaked marker is filtered here instead. A parser that merely looks
+plausible can be wrong in a way that only a real multi-step tool loop reveals.
+
+Gated repositories need a Hugging Face credential with somewhere to store it and a licence
+acceptance to surface.

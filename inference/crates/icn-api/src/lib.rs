@@ -2706,9 +2706,7 @@ fn reasoning_control(
                 ));
             }
             let effort = profile.default_effort.clone().ok_or_else(|| {
-                ApiError::invalid(
-                    "thinking_budget_tokens requires a classified reasoning default",
-                )
+                ApiError::invalid("thinking_budget_tokens requires a classified reasoning default")
             })?;
             return Ok(ReasoningControl::Resolved {
                 effort,

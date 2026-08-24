@@ -7,6 +7,7 @@
 //! so everything above this crate keeps working against the same generated HTTP contract.
 //!
 //! Module map:
+//!   - `acquisition` — installing a model: the serving image, then the weights
 //!   - `backend`  — CompletionBackend over the container's chat-completions endpoint
 //!   - `catalog`  — the model catalog ICN publishes; ACN cannot start without it
 //!   - `controller` — ModelInstanceController: one resident container, load/stop/lease
@@ -19,7 +20,9 @@
 //!   - `readiness` — waiting for a container to start serving, and reading its served name
 //!   - `request`  — ChatRequest to a vLLM chat-completions body
 //!   - `sse`      — server-sent event framing and OpenAI chat-chunk decoding
+//!   - `weights`  — fetching a repository into EIM's Local Directory layout
 
+pub mod acquisition;
 pub mod backend;
 pub mod catalog;
 pub mod controller;
@@ -32,3 +35,4 @@ pub mod properties;
 pub mod readiness;
 pub mod request;
 pub mod sse;
+pub mod weights;

@@ -54,6 +54,11 @@ pulled instead, which is the recommended production shape because a build is mul
 multi-minute. With neither, a missing image is reported rather than fetched: starting a large build
 unasked on an operator's host is not a reasonable default.
 
+Installing a model prepares that image and then fetches its weights from Hugging Face into the
+layout EIM reads, so export proxy variables before starting on a network without direct access —
+the daemon's proxy configuration does not reach this process, and the resulting timeout reads like a
+Hugging Face outage rather than missing configuration.
+
 EIM publishes no images of its own — its CI builds with `push: false` — so one of those two is
 required.
 

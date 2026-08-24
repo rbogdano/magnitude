@@ -26,11 +26,15 @@ use icn_contracts::bootstrap_protocol::{
     IcnStartupRecordType,
 };
 use icn_contracts::{HardwareProvider, HardwareSnapshot, InventoryError};
-use icn_eim::catalog::{DockerImageProbe, EimCatalog, EimDownloads};
+use icn_eim::acquisition::{
+    AcquisitionContext, CatalogAcquisition, DockerAcquisition, EimAcquisitions,
+};
+use icn_eim::catalog::{EimCatalog, EimDownloads};
 use icn_eim::controller::{EimControllerConfig, EimModelDefinition, EimModelInstanceController};
 use icn_eim::docker::cli::ProxySettings;
-use icn_eim::docker::image::ImageSource;
+use icn_eim::docker::image::{ImageResolver, ImageSource};
 use icn_eim::docker::{DockerCli, DockerPreflight};
+use icn_eim::weights::WeightSource;
 use icn_hardware::{CapacityPolicy, HostTopology};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 
@@ -100,6 +104,16 @@ enum Command {
         /// avoids inventing the layer and head counts the RAM estimate depends on.
         #[arg(long, env = "MAGNITUDE_EIM_CATALOG")]
         eim_catalog: Option<PathBuf>,
+        /// Hugging Face endpoint weights are fetched from.
+        #[arg(long, env = "MAGNITUDE_HF_ENDPOINT", default_value = icn_eim::weights::DEFAULT_ENDPOINT)]
+        hf_endpoint: String,
+        /// Let the container download its own weights instead of requiring them prefetched.
+        ///
+        /// The escape hatch for a model that reaches the hub for something its repository does
+        /// not contain. It costs the progress bar and re-downloads on every fresh container,
+        /// which is why it is not the default.
+        #[arg(long, env = "MAGNITUDE_EIM_ALLOW_CONTAINER_DOWNLOADS")]
+        allow_container_downloads: bool,
     },
     /// Report whether this host can serve models: Docker reachability and host capacity.
     Doctor {
@@ -157,6 +171,8 @@ async fn main() -> anyhow::Result<()> {
             eim_catalog,
             eim_registry,
             eim_source,
+            hf_endpoint,
+            allow_container_downloads,
         } => {
             if exit_on_stdin_eof {
                 install_parent_stdin_guard();
@@ -230,18 +246,32 @@ async fn main() -> anyhow::Result<()> {
                 };
                 tracing::info!(?image_source, "serving image resolution configured");
 
+                let host_cache_path = cache_root
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("/var/lib/magnitude/eim"))
+                    .join("eim/model-cache");
+                let proxy = ProxySettings::from_environment();
+                if proxy.https_proxy.is_none() {
+                    // Named rather than discovered later: on a network without direct internet
+                    // access the fetch fails with a connection timeout, which reads as a
+                    // Hugging Face outage rather than as missing configuration.
+                    tracing::info!(
+                        "no HTTPS proxy configured; weight downloads will go direct to {hf_endpoint}"
+                    );
+                }
                 let eim = Arc::new(EimModelInstanceController::new(
                     docker.clone(),
                     definitions,
                     EimControllerConfig {
                         icn_instance_id: instance_id.clone(),
-                        host_cache_path: cache_root
-                            .clone()
-                            .unwrap_or_else(|| PathBuf::from("/var/lib/magnitude/eim"))
-                            .join("eim/model-cache"),
-                        proxy: ProxySettings::from_environment(),
+                        host_cache_path: host_cache_path.clone(),
+                        proxy: proxy.clone(),
                         numa_nodes: u32::try_from(host.numa_nodes).unwrap_or(1),
-                        image_source,
+                        image_source: image_source.clone(),
+                        // Magnitude prefetches, so the cache mounts read-only and a cache miss
+                        // fails immediately instead of silently downloading tens of gigabytes
+                        // into a filesystem that dies with the container.
+                        offline_weights: !allow_container_downloads,
                         ..EimControllerConfig::default()
                     },
                     tokio::runtime::Handle::current(),
@@ -253,11 +283,27 @@ async fn main() -> anyhow::Result<()> {
                 }
                 // ACN calls GET /v1/models while building its layer graph and fails to become
                 // ready if it errors, so the catalog is not optional.
+                let acquisitions = Arc::new(EimAcquisitions::new(AcquisitionContext {
+                    resolver: Arc::new(ImageResolver::new(docker.clone(), image_source)),
+                    weights: Arc::new(
+                        WeightSource::through_proxy(
+                            hf_endpoint.clone(),
+                            std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty()),
+                            &proxy,
+                        )
+                        .map_err(|error| anyhow::anyhow!(error))?,
+                    ),
+                    cache_root: host_cache_path,
+                }));
                 catalog = Some(Arc::new(EimCatalog::new(
                     eim.definitions(),
-                    Arc::new(DockerImageProbe::new(docker)),
+                    Arc::new(DockerAcquisition::new(Arc::clone(&acquisitions), docker))
+                        as Arc<dyn CatalogAcquisition>,
                 )));
-                downloads = Some(Arc::new(EimDownloads));
+                downloads = Some(Arc::new(EimDownloads::new(
+                    acquisitions,
+                    eim.definitions(),
+                )));
                 controller = Some(eim);
                 AppState::model_free()
             }

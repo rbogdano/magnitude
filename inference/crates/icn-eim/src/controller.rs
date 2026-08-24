@@ -342,7 +342,7 @@ impl EimModelInstanceController {
         };
         let mut reaped = Vec::new();
         for container in owned {
-            if !container.is_orphan_of(&self.shared.config.icn_instance_id, pid_is_alive) {
+            if !container.is_orphan_of(std::process::id(), pid_is_alive) {
                 continue;
             }
             tracing::info!(
@@ -707,9 +707,21 @@ impl ModelInstanceController for EimModelInstanceController {
                 }
             }
 
-            // Stage 1 reclaims the image. The weight cache is removed alongside it once
-            // Magnitude owns prefetching, since otherwise "uninstall" frees a megabyte of
-            // layer and leaves tens of gigabytes of weights behind.
+            // Both halves, because Magnitude owns prefetching: removing only the image would
+            // free a megabyte of layer and leave tens of gigabytes of weights behind, which is
+            // the opposite of what someone reclaiming space asked for.
+            crate::weights::remove(
+                &self.shared.config.host_cache_path,
+                &definition.canonical_name,
+            )
+            .await
+            .map_err(|error| {
+                InventoryError::Io(format!(
+                    "removing weights for {}: {error}",
+                    definition.canonical_name
+                ))
+            })?;
+
             let invocation = self
                 .shared
                 .docker
@@ -912,18 +924,19 @@ async fn run_load(shared: Shared, request: LoadModelRequest, events: mpsc::Sende
     };
     let container = container_name(&shared.config.icn_instance_id, &request.instance_id.0);
 
-    // vLLM's CPU backend reserves a fraction of each NUMA node rather than an absolute size,
-    // and its default of 0.92 fails on a host with anything else resident. No shipped EIM
-    // profile sets it, so the reservation is derived from the estimate here.
-    let node_capacity_bytes = if shared.config.numa_nodes > 1 {
-        budget.stable_capacity_bytes / u64::from(shared.config.numa_nodes)
-    } else {
-        budget.stable_capacity_bytes
-    };
-    let cpu_utilization = crate::estimate::cpu_memory_utilization(
+    // The container ceiling and vLLM's reservation fraction multiply, so they come from one
+    // function rather than being set independently. No shipped EIM profile sets the fraction, and
+    // its default of 0.92 overcommits.
+    let memory_plan = crate::estimate::container_memory_plan(
         &estimate,
         shape.tensor_parallel_size,
-        node_capacity_bytes,
+        shared.config.memory_limit_percent,
+    );
+    tracing::info!(
+        limit_bytes = memory_plan.limit_bytes,
+        utilization = memory_plan.utilization,
+        ranks = shape.tensor_parallel_size,
+        "container memory plan"
     );
 
     let launch = LaunchEnvironment {
@@ -940,7 +953,7 @@ async fn run_load(shared: Shared, request: LoadModelRequest, events: mpsc::Sende
             .flatten(),
         proxy: shared.config.proxy.clone(),
         offline_weights: shared.config.offline_weights,
-        cpu_memory_utilization: Some(cpu_utilization),
+        cpu_memory_utilization: Some(memory_plan.utilization),
         engine_args_override: BTreeMap::new(),
     };
 
@@ -960,12 +973,7 @@ async fn run_load(shared: Shared, request: LoadModelRequest, events: mpsc::Sende
         .to_args(),
         environment: launch.to_environment(),
         mounts: vec![launch.cache_mount(&shared.config.host_cache_path.to_string_lossy())],
-        memory_limit_bytes: Some(
-            estimate
-                .required_bytes
-                .saturating_mul(shared.config.memory_limit_percent)
-                / 100,
-        ),
+        memory_limit_bytes: Some(memory_plan.limit_bytes),
         stop_timeout_seconds: 30,
         shm_size_bytes: Some(shared.config.shm_size_bytes),
         // Lets vLLM bind worker memory to a NUMA node. Without it every worker logs
@@ -1000,6 +1008,12 @@ async fn run_load(shared: Shared, request: LoadModelRequest, events: mpsc::Sende
         plan: Some(plan.clone()),
     })
     .await;
+
+    // The name is derived from this ICN's identity and the model instance, so a collision can only
+    // be a container we left behind. Removing it unconditionally is what makes the start
+    // independent of whether the reaper's liveness check happened to be right: a reused pid would
+    // otherwise make the name permanently unavailable.
+    let _ = shared.docker.remove(&container).await;
 
     if let Err(error) = shared.docker.run(&spec).await {
         shared.fail(operation_failure(
@@ -1208,11 +1222,16 @@ fn classify_startup_failure(exit_code: i64, logs: &str) -> ModelInstanceFailure 
     )
 }
 
+/// One realistic model definition, shared by the tests of every module that needs one.
+///
+/// Qwen3-8B because it is the entry this fork has actually served: its geometry, image tag,
+/// profile and parsers are the measured values rather than plausible ones.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests_support {
     use super::*;
 
-    fn geometry() -> ModelGeometry {
+    #[must_use]
+    pub(crate) fn geometry() -> ModelGeometry {
         ModelGeometry {
             total_parameters: 8_200_000_000,
             weight_bytes: None,
@@ -1226,7 +1245,8 @@ mod tests {
         }
     }
 
-    fn definition() -> EimModelDefinition {
+    #[must_use]
+    pub(crate) fn definition() -> EimModelDefinition {
         EimModelDefinition {
             configuration_id: ModelServingConfigurationId("eim-qwen3-8b-ctx32768".to_owned()),
             package_id: ModelPackageId("eim--Qwen--Qwen3-8B--v1".to_owned()),
@@ -1255,6 +1275,12 @@ mod tests {
             weight_bytes: 16_400_000_000,
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tests_support::{definition, geometry};
 
     fn controller() -> EimModelInstanceController {
         EimModelInstanceController::new(
