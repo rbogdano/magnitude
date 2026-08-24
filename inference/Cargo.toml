@@ -3,14 +3,16 @@
 # icn-reasoning, icn-speculative, icn-parity, icn-parity-probe, and
 # benchmark-runner (whose OpenAI SSE client moved into icn-eim).
 #
-# Excluded until stage 2, when each gets the surgery the plan describes:
-#   icn-models  — drop gguf.rs/planner_stub.rs/preview.rs/identity.rs, retarget download.rs
-#                 from single GGUF files to whole safetensors repositories
-#   icn-catalog — rewrite around the EIM catalog importer; it still calls the deleted crates
-# Stage 1 needs neither: every AppState collaborator is an optional `Arc<dyn Trait>` defined
-# in icn-api, so a container-backed server compiles without any model inventory.
+# icn-catalog is deleted: both of its commands were for the GGUF world. `update-lock` advanced a
+# catalog lock that no longer exists -- EIM images are pinned by tag instead -- and `build-bundle`
+# produced inputs for the native planner. Catalog import now lives in eim/generate-models.py and
+# image building in icn-eim.
+#
+# icn-models is excluded until it is retargeted from single GGUF files to whole safetensors
+# repositories. Nothing needs it yet: every AppState collaborator is an optional `Arc<dyn Trait>`
+# defined in icn-api, so a container-backed server compiles without a model inventory.
 members = ["crates/icn-api", "crates/icn-contracts", "crates/icn-eim", "crates/icn-hardware", "crates/icn-server", "crates/icn-utils"]
-exclude = ["crates/icn-catalog", "crates/icn-models"]
+exclude = ["crates/icn-models"]
 resolver = "2"
 
 [workspace.package]

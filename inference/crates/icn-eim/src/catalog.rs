@@ -186,6 +186,29 @@ impl EimCatalog {
         }
     }
 
+    /// The installed-package record for one model, shared by both surfaces that report it.
+    ///
+    /// The catalog's local state and `/v1/models/installed` describe the same thing, so they are
+    /// built from one function. Reporting an installed model with no packages in one of them
+    /// would be a lie in the data even where nothing currently reads it.
+    fn installed_package(definition: &EimModelDefinition) -> InstalledModelPackage {
+        InstalledModelPackage {
+            package: crate::package::model_package(definition),
+            // The in-container weight cache. Not a host path: ICN never opens it, and reporting a
+            // host path would imply the weights are reachable from here.
+            path: std::path::PathBuf::from(crate::env_contract::CONTAINER_CACHE_PATH)
+                .join(&definition.canonical_name),
+            origin: ModelPackageInstallationOrigin::Magnitude,
+            inspection: ModelPackageInspection::Inspected {
+                capabilities: Self::capabilities(definition),
+            },
+            catalog_attribution: InstalledCatalogAttribution::Attributed {
+                model_id: CatalogModelId(definition.catalog_model_id.clone()),
+                variant_id: CatalogVariantId(definition.catalog_variant_id.clone()),
+            },
+        }
+    }
+
     /// Turns one definition into a catalog entry, or a diagnostic when its data is unusable.
     fn entry(
         definition: &EimModelDefinition,
@@ -235,7 +258,7 @@ impl EimCatalog {
                             icn_contracts::models::CatalogModelEffectiveConfiguration::Runnable {
                                 configuration: Self::configuration(definition),
                             },
-                        packages: Vec::new(),
+                        packages: vec![Self::installed_package(definition)],
                     },
                     update_state: icn_contracts::models::CatalogModelUpdateState::Current,
                 }
@@ -575,6 +598,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn both_surfaces_describe_an_installed_model_identically() {
+        struct AllInstalled;
+        impl InstalledImageProbe for AllInstalled {
+            fn is_installed(&self, _image: &str) -> BoxFuture<'_, bool> {
+                Box::pin(async { true })
+            }
+        }
+        let catalog = EimCatalog::new(
+            Arc::new(BTreeMap::from([(
+                definition().configuration_id,
+                definition(),
+            )])),
+            Arc::new(AllInstalled),
+        );
+
+        let from_catalog = match &catalog.list().await.expect("a catalog").catalog_models[0]
+            .local_state
+        {
+            CatalogModelLocalState::Installed { installation, .. } => installation.packages.clone(),
+            other => panic!("expected Installed, got {other:?}"),
+        };
+        let from_installed = catalog
+            .list_installed()
+            .await
+            .expect("installed packages")
+            .packages;
+
+        // The client derives its installed state from the second surface but reads the first for
+        // update and configuration; disagreement between them would be a latent trap.
+        assert_eq!(from_catalog, from_installed);
+        assert_eq!(from_catalog.len(), 1);
+        assert_eq!(from_catalog[0].package.id, definition().package_id);
+    }
+
+    #[tokio::test]
     async fn refuses_installation_explicitly_instead_of_admitting_it() {
         // Reporting an admitted download that never progresses would leave the client waiting.
         let error = catalog(vec![definition()])
@@ -650,21 +708,7 @@ impl InstalledModelPackages for EimCatalog {
                 if !self.packages.is_installed(&definition.image).await {
                     continue;
                 }
-                packages.push(InstalledModelPackage {
-                    package: crate::package::model_package(definition),
-                    // The in-container weight cache. Not a host path: ICN never opens it, and
-                    // reporting a host path would imply the weights are reachable from here.
-                    path: std::path::PathBuf::from(crate::env_contract::CONTAINER_CACHE_PATH)
-                        .join(&definition.canonical_name),
-                    origin: ModelPackageInstallationOrigin::Magnitude,
-                    inspection: ModelPackageInspection::Inspected {
-                        capabilities: Self::capabilities(definition),
-                    },
-                    catalog_attribution: InstalledCatalogAttribution::Attributed {
-                        model_id: CatalogModelId(definition.catalog_model_id.clone()),
-                        variant_id: CatalogVariantId(definition.catalog_variant_id.clone()),
-                    },
-                });
+                packages.push(Self::installed_package(definition));
             }
             Ok(InstalledModelPackagesResponse {
                 revision: 1,

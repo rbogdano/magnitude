@@ -1,197 +1,86 @@
 # Magnitude ICN
 
-This workspace builds the Inference Control Node. `icn-contracts` defines transport- and
-backend-neutral contracts; `icn-models`, `icn-hardware`, and `icn-reasoning` own model lifecycle,
-fit assessment, and template reasoning inspection; `icn-engine` owns live inference; `icn-api`
-exports the HTTP/OpenAPI boundary; and `icn-server` is the composition root.
+The Inference Control Node. It decides which model to serve, owns that model's lifecycle, and
+carries chat between the agent and the engine.
 
-The native dependency has two independently recorded revisions in `native-pin.toml`: the exact
-`llama-cpp-rs` commit and the llama.cpp gitlink embedded by that commit. The editable binding source
-is checked out at `native/llama-cpp-rs`; the inference workspace must consume its `llama-cpp-2`
-crate by relative path rather than resolving a second Cargo Git checkout. Run
-`bun icn:verify-native-pin` after changing either pin; the ICN-facing backend interface remains
-unchanged.
+The engine is not in this process. Inference runs in an Intel EIM container: a Docker image that
+matches the host to the model, resolves a validated vLLM profile at startup, and serves an
+OpenAI-compatible API on port 8000. ICN starts and stops that container and speaks HTTP to it.
 
-## Native submodule management
+    crates/icn-contracts   transport- and backend-neutral contracts
+    crates/icn-api         the HTTP and OpenAPI boundary
+    crates/icn-eim         the container backend: Docker, vLLM transport, model fit
+    crates/icn-hardware    host memory policy and CPU discovery
+    crates/icn-server      composition root
+    crates/icn-utils
 
-The native source is nested and pinned:
+`icn-contracts` and `icn-api` know nothing about containers. Everything specific to EIM sits behind
+the two traits the API already defines: `CompletionBackend` for inference, `ModelInstanceController`
+for lifecycle. That separation is why swapping the engine left the client stack untouched.
 
-```text
-magnitude
-└── inference/native/llama-cpp-rs       # our bindings fork
-    └── llama-cpp-sys-2/llama.cpp       # exact upstream llama.cpp revision
-```
+`crates/icn-models` is excluded from the workspace. It was built for a GGUF inventory on local disk
+and needs retargeting to whole safetensors repositories before it can come back.
 
-We do **not** need utilityai or llama.cpp to accept our changes. Binding changes are committed and
-pushed to `magnitudedev/llama-cpp-rs`. Upstream PRs are optional.
+## Pins
 
-Magnitude stores only the exact bindings-fork commit, not changes made inside the submodule. The
-required order for a bindings change is therefore:
+`eim-pin.toml` records the EIM revision serving images are built from and the vLLM base image those
+layers sit on. Both feed `eim_build()`, which the client compares three times during startup, so a
+mismatched installation is rejected by an invariant that already existed for this class of problem.
 
-1. Change and test `inference/native/llama-cpp-rs`.
-2. Commit and push that change to `magnitudedev/llama-cpp-rs`.
-3. Commit the updated `inference/native/llama-cpp-rs` pointer in Magnitude.
-
-Never point Magnitude at an unpushed bindings commit; other checkouts and CI could not fetch it.
-
-We normally do not modify llama.cpp. To upgrade it, update its nested commit pointer and commit that
-pointer in our bindings fork. Create a llama.cpp fork only if we actually need native patches.
-
-The bindings fork directly compiles its checked-in C/C++ wrapper sources, including the
-`wrapper_common_fit` surface, alongside the pinned llama.cpp checkout; it does not generate or
-apply a source overlay. [`parity/upstream/binding-surfaces.json`](parity/upstream/binding-surfaces.json)
-is the parity-owned audit inventory that maps relevant upstream, bridge, and safe Rust surfaces. It
-is not a fork build input; review it whenever either native pin or a parity-relevant safe surface
-changes.
-
-Initialize both submodules after cloning Magnitude:
-
-```sh
-git submodule update --init --recursive
-```
+There is no native source to pin. A base-image change alters accepted engine arguments and
+tool-call parser names, which is why it invalidates a prepared installation exactly as a bindings
+change once did.
 
 ## First five minutes
 
-Run these commands from the Magnitude repository root.
+    bun run dev:version          # a development version selects the development installation
+    bun icn:build                # builds the binary and stages target/development
+    bun icn:doctor               # is this host able to serve at all?
 
-Compile the development binary:
+`doctor` answers the question that matters before anything else: whether the Docker daemon is
+reachable, and what the host looks like. On a dual-socket machine it reports two NUMA nodes and
+therefore a maximum tensor-parallel size of two, which is the fact that decides which EIM serving
+profiles are usable.
 
-```sh
-bun icn:build
-```
+    bun icn:dev                  # deterministic in-memory backend, no daemon needed
+    bun icn:serve                # build and serve for real
 
-The executable is now at `inference/target/debug/magnitude-icn`. Start it with the deterministic fake
-backend, which does not need a model file:
+Serving a model needs a built image and the model table:
 
-```sh
-bun icn:dev
-```
+    magnitude-icn serve --eim-catalog eim/models.json --eim-source ~/eim
 
-In another terminal, check health and make a streaming completion:
+With `--eim-source` a missing image is built from that EIM checkout; with `--eim-registry` it is
+pulled instead, which is the recommended production shape because a build is multi-gigabyte and
+multi-minute. With neither, a missing image is reported rather than fetched: starting a large build
+unasked on an operator's host is not a reasonable default.
 
-```sh
-curl -sS http://127.0.0.1:8080/health
+EIM publishes no images of its own — its CI builds with `push: false` — so one of those two is
+required.
 
-curl -N http://127.0.0.1:8080/v1/chat/completions \
-  -H 'content-type: application/json' \
-  --data '{
-    "model": "icn-fake",
-    "messages": [{"role": "user", "content": "Hello"}],
-    "stream": true,
-    "stream_options": {"include_usage": true}
-  }'
-```
+## Build and verification
 
-The second command prints OpenAI-compatible `data:` frames followed by `data: [DONE]`. Stop the
-server with Ctrl-C.
+    cargo test --manifest-path Cargo.toml --workspace
+    cargo clippy --manifest-path Cargo.toml --workspace --all-targets -- -D warnings
+    bun icn:check-generated      # the generated client protocol must not drift
 
-Set the top-level request field `"timings_per_token": true` to enable llama.cpp-compatible
-cumulative timing snapshots on streamed model updates. A sampled token can produce zero or several
-semantic deltas. The initial `{"role":"assistant","content":null}` delta belongs to the first
-sampled-token result: when that result also has parser deltas, only its last parser delta receives
-the snapshot; when it has none, the role delta receives it. Later results with no parser delta emit
-no SSE event, so the server never creates a timing-only event.
+Integration suites need a real daemon and skip without one:
 
-The flag controls ordinary partial snapshots, but llama.cpp has one termination edge: a full stop
-word detected before a partial result is sent makes that result include timings even when the flag
-is false. EOS and length termination are detected after their partial-result timing decision and do
-not do so. The final timing summary is always present on the finish chunk or, when `include_usage`
-is enabled, the empty-choices usage chunk.
+    docker build -t magnitude-eim-stub:test eim/stub
+    MAGNITUDE_EIM_STUB_IMAGE=magnitude-eim-stub:test cargo test -p icn-eim --test container_lifecycle
+    MAGNITUDE_EIM_SOURCE=~/eim cargo test -p icn-eim --test image_resolution
 
-To use a real GGUF model:
+## Testing philosophy
 
-```sh
-bun icn:serve -- \
-  --model /absolute/path/to/model.gguf \
-  --model-alias my-model \
-  --bind 127.0.0.1:8080
-```
+Anything decidable without a daemon is a unit test: argv construction, chunk decoding, the memory
+formula, failure classification. That keeps the suite runnable on a laptop, which matters because
+the real serving path is not — `vllm/vllm-openai-cpu` needs AVX-512, and a model load takes minutes
+where it works at all.
 
-Use `my-model` in the same completion request. On Apple Silicon, the pinned bindings enable their
-macOS Metal backend. `--gpu-layers 0` forces CPU execution; the default attempts to offload all
-layers.
+`eim/stub` stands in for a serving container so the lifecycle can be exercised anyway. It reports a
+served model name unrelated to `INFERENCE_MODEL_ID` on purpose: vLLM validates requests against its
+own served name, so code that assumes the two agree fails loudly here rather than in production.
 
-## Build and verification commands
-
-Useful commands from the monorepo root:
-
-```sh
-bun icn:check                 # type-check the Rust workspace without linking a final binary
-bun icn:build                 # debug binary, fastest normal development build
-bun icn:build:release         # optimized binary at inference/target/release/magnitude-icn
-bun icn:build:reference       # selected pinned tests, official tools, and native oracle
-bun icn:test                  # Rust API, SSE, backend, and workspace tests
-bun icn:parity:validate       # validate cases, fixtures, profiles, targets, and model registry
-bun icn:parity:list           # list primitive cases and implementation status
-bun icn:parity:test:ts        # test reference/model/provenance scripts
-bun icn:build:candidate -- --reference-manifest <path> # build the production ICN parity probe with provenance
-bun icn:generate
-bun icn:check-generated
-bun icn:verify-native-pin
-bun icn:doctor
-bun icn:version
-```
-
-`bun icn:build:reference -- --backend metal --target focused-tests --target oracle` builds only
-declared targets from the exact nested llama.cpp source used by the Rust bindings. Other target IDs
-include `llama-bench`, `llama-batched-bench`, `llama-perplexity`, `backend-ops`, and
-`quantize-perf`. The builder records source, configuration, artifact, and oracle digests; use
-`--dry-run` to inspect the resolved build without compiling. Every invocation reserves a fresh
-CMake tree, uses an allowlisted build environment, and records compile/link evidence for assertion
-and sanitizer status; an earlier CMake cache is never reused as parity evidence.
-
-## Inference testing philosophy
-
-Inference validation has three complementary categories:
-
-1. **Correctness parity** compares the smallest observable native and ICN operations: outputs,
-   effective configuration, and state transitions.
-2. **Performance parity** times those same isolated operations only after both sides prove they
-   performed equivalent work.
-3. **Composite inference benchmarking** sends controlled completion workloads to ICN and pinned
-   `llama-server` endpoints to measure the complete engine, including scheduling, concurrency,
-   prefix reuse, mixed prefill/decode work, latency, throughput, fairness, memory, and failures.
-
-The primitive suites make failures attributable; the composite benchmark establishes whether the
-complete engine is competitive. Composite fixtures define requests or deterministic agentic
-workflows together with prompt/output sizes, shared-prefix topology, arrival schedule, concurrency,
-and cold/warm state. Strict comparisons use identical model bytes, templates, settings, sampling,
-and token work; response or work divergence is a correctness result and invalidates timing. The
-same fixtures should support ICN-versus-llama.cpp comparison, ICN regression testing, and an opt-in
-public hardware benchmark exposed through the server and CLI.
-
-The versioned suite lives in [`benchmark/`](benchmark/), and the reusable library plus CLI is the
-`benchmark-runner` crate. It always exercises the configured HTTP endpoint, whether invoked from
-developer tooling or application code.
-
-## Primitive parity
-
-`parity/` contains neutral cases, fixtures, profiles, the content-addressed model registry, upstream
-target manifests, JSON evidence schemas, and the thin native C++ oracle. `icn-parity` validates and
-runs these assets without depending on the Rust bindings fork. It supports unchanged upstream
-tests, official upstream tools, and differential native-oracle/ICN-probe cases. Comparisons happen
-outside both producer processes and are exact, structural, tolerance-based, capability-based, or
-same-work performance ratios.
-
-Parity execution never uses a generated chat response or HTTP exchange as primitive evidence.
-The production `icn-probe` exposes the active paired operations through production-owned
-`icn-engine` code; descriptor status remains authoritative, with genuine artifact or production
-API gaps kept `planned` or `disabled`. The `diagnostic` profile is an uncontrolled, non-gating
-two-sided functional smoke. `native-diagnostic` separately runs the one-sided native C0/P0 checks
-without making a candidate-parity or controlled-performance claim. Generated run directories live
-under `results/parity/`.
-Downloaded parity models live under `target/parity-models/`. Both locations, all native/Rust build
-trees, and candidate artifacts are generated and ignored by the repository.
-
-`bun icn:generate` runs the Rust OpenAPI exporter and regenerates the complete ICN protocol under
-`packages/icn-protocol`: bootstrap records, HTTP schemas, HttpApi declarations, operation and
-streaming descriptors, generated client, and manifest. `bun icn:check-generated` performs the same
-derivation without writing and fails if any committed output is stale.
-
-The `inference/` directory is also a Bun workspace, so the equivalent short forms work:
-
-```sh
-bun run --cwd inference build
-bun run --cwd inference test
-bun run --cwd inference dev
-```
+What cannot be automated is written down instead. `eim/VERIFY.md` lists the manual checks, including
+four things a hand-run container will not forgive. A probe script that tried to automate the daemon
+check was removed after it reported "not ready" for a daemon that was ready: a check whose failures
+are indistinguishable from real ones is worse than none.
