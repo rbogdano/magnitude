@@ -10,9 +10,11 @@
 //! lifecycle decisions.
 
 pub mod cli;
+pub mod image;
 pub mod inspect;
 pub mod naming;
 
 pub use cli::{DockerCli, DockerError, DockerInvocation, DockerPreflight};
+pub use image::{ImageError, ImageOutcome, ImageResolver, ImageSource, ImageStage};
 pub use inspect::{ContainerState, ContainerStatus, ImageSummary};
 pub use naming::{ContainerLabels, OWNER_LABEL, OWNER_VALUE, OwnedContainer};

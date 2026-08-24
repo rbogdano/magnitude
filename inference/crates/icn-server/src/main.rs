@@ -29,6 +29,7 @@ use icn_contracts::{HardwareProvider, HardwareSnapshot, InventoryError};
 use icn_eim::catalog::{DockerImageProbe, EimCatalog, EimDownloads};
 use icn_eim::controller::{EimControllerConfig, EimModelDefinition, EimModelInstanceController};
 use icn_eim::docker::cli::ProxySettings;
+use icn_eim::docker::image::ImageSource;
 use icn_eim::docker::{DockerCli, DockerPreflight};
 use icn_hardware::{CapacityPolicy, HostTopology};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
@@ -86,6 +87,14 @@ enum Command {
         /// Command used to reach Docker, for sites that need a wrapper such as `sudo -n docker`.
         #[arg(long, env = "MAGNITUDE_DOCKER_COMMAND", default_value = "docker")]
         docker_command: String,
+        /// Registry holding prebuilt serving images. When set, a missing image is pulled from
+        /// it. Recommended for production: a local build is multi-gigabyte and multi-minute.
+        #[arg(long, env = "MAGNITUDE_EIM_REGISTRY")]
+        eim_registry: Option<String>,
+        /// EIM checkout used as the build context when an image must be built locally. EIM
+        /// publishes no images, so this is the developer path.
+        #[arg(long, env = "MAGNITUDE_EIM_SOURCE")]
+        eim_source: Option<PathBuf>,
         /// JSON table of servable EIM models. Stage 2 replaces this with the generated catalog
         /// and its geometry overlay; until that overlay exists, supplying the table as data
         /// avoids inventing the layer and head counts the RAM estimate depends on.
@@ -146,6 +155,8 @@ async fn main() -> anyhow::Result<()> {
             installation,
             docker_command,
             eim_catalog,
+            eim_registry,
+            eim_source,
         } => {
             if exit_on_stdin_eof {
                 install_parent_stdin_guard();
@@ -199,6 +210,26 @@ async fn main() -> anyhow::Result<()> {
                     "EIM model table loaded"
                 );
 
+                // Pull when a registry is configured, build when a checkout is available, and
+                // otherwise refuse to do either: starting a multi-gigabyte build unasked on an
+                // operator's host is not a reasonable default.
+                let image_source = match (&eim_registry, &eim_source) {
+                    (Some(_), _) => ImageSource::Registry,
+                    (None, Some(source)) => ImageSource::Build {
+                        eim_source: source.clone(),
+                        parent_registry: build_identity::eim_parent_registry().to_owned(),
+                        parent_repository: build_identity::eim_parent_repository().to_owned(),
+                        parent_tag: build_identity::eim_parent_tag().to_owned(),
+                        base_image: format!(
+                            "{}-base:{}",
+                            build_identity::EIM_IMAGE_TAG_PREFIX,
+                            build_identity::eim_parent_tag()
+                        ),
+                    },
+                    (None, None) => ImageSource::PresentOnly,
+                };
+                tracing::info!(?image_source, "serving image resolution configured");
+
                 let eim = Arc::new(EimModelInstanceController::new(
                     docker.clone(),
                     definitions,
@@ -209,6 +240,8 @@ async fn main() -> anyhow::Result<()> {
                             .unwrap_or_else(|| PathBuf::from("/var/lib/magnitude/eim"))
                             .join("eim/model-cache"),
                         proxy: ProxySettings::from_environment(),
+                        numa_nodes: u32::try_from(host.numa_nodes).unwrap_or(1),
+                        image_source,
                         ..EimControllerConfig::default()
                     },
                     tokio::runtime::Handle::current(),

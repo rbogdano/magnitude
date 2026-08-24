@@ -60,6 +60,30 @@ pub(crate) fn eim_build() -> String {
     format!("eim_{:x}", digest.finalize())
 }
 
+/// Splits the pinned parent image reference into the parts EIM's base build expects.
+///
+/// `eim-pin.toml` records it as one reference because that is how it is read and compared, while
+/// EIM's Dockerfile takes registry, repository and tag as separate build arguments.
+fn eim_parent_parts() -> (&'static str, &'static str, &'static str) {
+    let (host, rest) = EIM_BASE_IMAGE
+        .split_once('/')
+        .unwrap_or(("docker.io", EIM_BASE_IMAGE));
+    let (repository, tag) = rest.rsplit_once(':').unwrap_or((rest, "latest"));
+    (host, repository, tag)
+}
+
+pub(crate) fn eim_parent_registry() -> &'static str {
+    eim_parent_parts().0
+}
+
+pub(crate) fn eim_parent_repository() -> &'static str {
+    eim_parent_parts().1
+}
+
+pub(crate) fn eim_parent_tag() -> &'static str {
+    eim_parent_parts().2
+}
+
 pub(crate) fn backend_module_abi() -> String {
     format!("eim-vllm-{EIM_BASE_IMAGE}")
 }
@@ -81,6 +105,24 @@ mod tests {
         assert_eq!(identity.native_build, eim_build());
         assert!(identity.native_build.starts_with("eim_"));
         assert!(!identity.target.is_empty());
+    }
+
+    #[test]
+    fn splits_the_pinned_parent_image_into_build_arguments() {
+        // EIM's Dockerfile takes these as three separate arguments, while the pin records one
+        // reference; a wrong split would produce an image that cannot be found.
+        assert_eq!(eim_parent_registry(), "docker.io");
+        assert_eq!(eim_parent_repository(), "vllm/vllm-openai-cpu");
+        assert_eq!(eim_parent_tag(), "v0.26.0");
+        assert_eq!(
+            format!(
+                "{}/{}:{}",
+                eim_parent_registry(),
+                eim_parent_repository(),
+                eim_parent_tag()
+            ),
+            EIM_BASE_IMAGE
+        );
     }
 
     #[test]

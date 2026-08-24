@@ -36,6 +36,7 @@ use tokio_stream::wrappers::{ReceiverStream, WatchStream};
 
 use crate::docker::DockerCli;
 use crate::docker::cli::{ContainerSpec, ProxySettings};
+use crate::docker::image::{ImageError, ImageResolver, ImageSource};
 use crate::docker::naming::{ContainerLabels, container_name};
 use crate::env_contract::{CONTAINER_PORT, LaunchEnvironment};
 use crate::estimate::{HostBudget, MemoryEstimate, ModelGeometry, ServingShape};
@@ -153,6 +154,8 @@ pub struct EimControllerConfig {
     /// How many NUMA nodes the host exposes, used to size the per-node memory reservation vLLM
     /// asks for. Zero means unknown, which makes the reservation fall back to its ceiling.
     pub numa_nodes: u32,
+    /// Where a serving image comes from when it is not already on the host.
+    pub image_source: ImageSource,
 }
 
 impl Default for EimControllerConfig {
@@ -168,6 +171,9 @@ impl Default for EimControllerConfig {
             memory_limit_percent: 115,
             shm_size_bytes: 16 * 1024 * 1024 * 1024,
             numa_nodes: 1,
+            // Conservative by default: never start a multi-gigabyte build unasked. The server
+            // opts into building or pulling once it knows the operator's configuration.
+            image_source: ImageSource::PresentOnly,
         }
     }
 }
@@ -486,6 +492,30 @@ impl Shared {
 
     fn fail(&self, failure: ModelInstanceFailure) {
         self.set_lifecycle(ModelInstanceLifecycle::Failed { failure });
+    }
+}
+
+/// Maps an image-resolution failure onto a code the client can act on.
+///
+/// The distinctions matter: a broken daemon, an absent image on a host configured not to build,
+/// and a missing EIM checkout each call for something different from the operator.
+fn image_failure(error: &ImageError) -> ModelInstanceFailure {
+    match error {
+        ImageError::Docker(_) => operation_failure("eim_docker_failed", error.to_string(), true),
+        ImageError::Absent { .. } => {
+            operation_failure("eim_image_missing", error.to_string(), false)
+        }
+        ImageError::MissingSource { .. } => {
+            operation_failure("eim_source_missing", error.to_string(), false)
+        }
+        ImageError::MalformedModelId(_) => {
+            operation_failure("eim_catalog_invalid", error.to_string(), false)
+        }
+        // A build or pull that reported success but left no image is a daemon-level oddity worth
+        // retrying rather than declaring permanent.
+        ImageError::NoImageAfter { .. } => {
+            operation_failure("eim_image_unresolved", error.to_string(), true)
+        }
     }
 }
 
@@ -834,22 +864,19 @@ async fn run_load(shared: Shared, request: LoadModelRequest, events: mpsc::Sende
     })
     .await;
 
-    let image = match shared.docker.image_summary(&definition.image).await {
-        Ok(Some(image)) => image,
-        Ok(None) => {
-            emit(ModelLoadEvent::Failed {
-                failure: operation_failure(
-                    "eim_image_missing",
-                    format!("serving image {} is not present locally", definition.image),
-                    false,
-                ),
-            })
-            .await;
-            return;
-        }
+    let resolver = ImageResolver::new(shared.docker.clone(), shared.config.image_source.clone());
+    // Building the base image downloads gigabytes and takes minutes; logging each stage is what
+    // separates that from a hang.
+    let outcome = resolver
+        .resolve(&definition.image, &definition.canonical_name, |stage| {
+            tracing::info!(image = %definition.image, stage = stage.describe(), "resolving image");
+        })
+        .await;
+    let image = match outcome {
+        Ok(outcome) => outcome.summary().clone(),
         Err(error) => {
             emit(ModelLoadEvent::Failed {
-                failure: operation_failure("eim_docker_failed", error.to_string(), true),
+                failure: image_failure(&error),
             })
             .await;
             return;
@@ -1455,6 +1482,48 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn distinguishes_the_ways_an_image_can_be_unavailable() {
+        let cases = [
+            (
+                ImageError::Absent {
+                    image: "x:v1".to_owned(),
+                },
+                "eim_image_missing",
+                false,
+            ),
+            (
+                ImageError::MissingSource {
+                    path: std::path::PathBuf::from("/nope"),
+                },
+                "eim_source_missing",
+                false,
+            ),
+            (
+                ImageError::MalformedModelId("no-org".to_owned()),
+                "eim_catalog_invalid",
+                false,
+            ),
+            (
+                ImageError::NoImageAfter { stage: "build" },
+                "eim_image_unresolved",
+                true,
+            ),
+        ];
+        for (error, expected_code, expected_retryable) in cases {
+            match image_failure(&error) {
+                ModelInstanceFailure::Operation {
+                    code, retryable, ..
+                } => {
+                    assert_eq!(code, expected_code, "{error:?}");
+                    // A configuration mistake will not fix itself; a daemon oddity might.
+                    assert_eq!(retryable, expected_retryable, "{error:?}");
+                }
+                other => panic!("expected an operation failure, got {other:?}"),
+            }
+        }
     }
 
     #[test]
