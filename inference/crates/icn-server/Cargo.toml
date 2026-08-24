@@ -3,27 +3,27 @@ name = "icn-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "ICN composition root: HTTP boundary over the EIM container backend"
 
 [[bin]]
 name = "magnitude-icn"
 path = "src/main.rs"
 
+# The GPU/Metal/Vulkan feature graph is gone with llama.cpp. A container-backed engine has one
+# acceleration story — vLLM on Xeon inside the EIM image — and the daemon it talks to is
+# discovered at runtime, not selected at compile time. `ash` and `libloading` went with the
+# CUDA and Vulkan probes they existed for.
+
 [dependencies]
 anyhow.workspace = true
-ash = { version = "0.38.0", default-features = false, features = ["loaded"] }
 axum.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 icn-api.workspace = true
 icn-contracts.workspace = true
-icn-engine.workspace = true
+icn-eim.workspace = true
 icn-hardware.workspace = true
-icn-models.workspace = true
-icn-speculative.workspace = true
-icn-reasoning.workspace = true
 libc.workspace = true
-libloading = "0.8.9"
-llama-cpp-2.workspace = true
 opentelemetry.workspace = true
 opentelemetry-appender-tracing.workspace = true
 opentelemetry-otlp.workspace = true
@@ -38,15 +38,6 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
-
-[features]
-default = ["mtmd", "dynamic-backends"]
-cuda = ["icn-engine/cuda", "icn-hardware/cuda", "icn-speculative/cuda"]
-cuda-no-vmm = ["icn-engine/cuda-no-vmm", "icn-hardware/cuda-no-vmm", "icn-speculative/cuda-no-vmm"]
-dynamic-backends = ["llama-cpp-2/dynamic-backends"]
-metal = ["icn-engine/metal", "icn-hardware/metal", "icn-speculative/metal"]
-mtmd = ["icn-engine/mtmd", "icn-hardware/mtmd"]
-vulkan = ["icn-engine/vulkan", "icn-hardware/vulkan", "icn-speculative/vulkan"]
 
 [dev-dependencies]
 tempfile = "3.24.0"

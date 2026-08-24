@@ -1,6 +1,16 @@
 [workspace]
-members = ["crates/benchmark-runner", "crates/icn-api", "crates/icn-catalog", "crates/icn-contracts", "crates/icn-engine", "crates/icn-hardware", "crates/icn-models", "crates/icn-speculative", "crates/icn-parity", "crates/icn-parity-probe", "crates/icn-reasoning", "crates/icn-server", "crates/icn-utils"]
-exclude = ["native/llama-cpp-rs"]
+# EIM container backend: llama.cpp is gone. Deleted crates were icn-engine,
+# icn-reasoning, icn-speculative, icn-parity, icn-parity-probe, and
+# benchmark-runner (whose OpenAI SSE client moved into icn-eim).
+#
+# Excluded until stage 2, when each gets the surgery the plan describes:
+#   icn-models  — drop gguf.rs/planner_stub.rs/preview.rs/identity.rs, retarget download.rs
+#                 from single GGUF files to whole safetensors repositories
+#   icn-catalog — rewrite around the EIM catalog importer; it still calls the deleted crates
+# Stage 1 needs neither: every AppState collaborator is an optional `Arc<dyn Trait>` defined
+# in icn-api, so a container-backed server compiles without any model inventory.
+members = ["crates/icn-api", "crates/icn-contracts", "crates/icn-eim", "crates/icn-hardware", "crates/icn-server", "crates/icn-utils"]
+exclude = ["crates/icn-catalog", "crates/icn-models"]
 resolver = "2"
 
 [workspace.package]
@@ -25,13 +35,11 @@ hyper = { version = "1.10.1", features = ["client", "http1"] }
 hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1", "tokio"] }
 icn-api = { path = "crates/icn-api" }
 icn-contracts = { path = "crates/icn-contracts" }
-icn-engine = { path = "crates/icn-engine", default-features = false }
+icn-eim = { path = "crates/icn-eim" }
 icn-hardware = { path = "crates/icn-hardware", default-features = false }
-icn-models = { path = "crates/icn-models" }
-icn-speculative = { path = "crates/icn-speculative", default-features = false }
-icn-reasoning = { path = "crates/icn-reasoning" }
+# icn-models returns in stage 2 (see [workspace].exclude)
+# icn-models = { path = "crates/icn-models" }
 icn-utils = { path = "crates/icn-utils" }
-llama-cpp-2 = { path = "native/llama-cpp-rs/llama-cpp-2", default-features = false, features = ["common"] }
 libc = "0.2.180"
 opentelemetry = { version = "0.32.0", features = ["logs", "trace"] }
 opentelemetry-appender-tracing = "0.32.0"

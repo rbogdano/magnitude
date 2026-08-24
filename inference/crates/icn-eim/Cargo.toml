@@ -1,0 +1,23 @@
+[package]
+name = "icn-eim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Intel EIM container backend for ICN: Docker lifecycle, vLLM chat transport, and RAM-based model fit"
+
+[dependencies]
+anyhow.workspace = true
+futures-util.workspace = true
+icn-api.workspace = true
+icn-contracts.workspace = true
+icn-hardware.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "process", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
