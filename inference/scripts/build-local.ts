@@ -1,172 +1,114 @@
-import {
-  access,
-  copyFile,
-  mkdir,
-  mkdtemp,
-  rename,
-  rm,
-  writeFile,
-} from "node:fs/promises";
-import { constants } from "node:fs";
-import { basename, delimiter, dirname, resolve } from "node:path";
+import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { IcnInstallationDeclaration } from "@magnitudedev/icn-protocol";
 import { Schema } from "effect";
-import { getDefaultBunTarget } from "../../scripts/release-target";
-import { buildIcnBinary } from "./compile";
+
+/**
+ * Stages a development ICN installation.
+ *
+ * Much smaller than it was. The previous build produced a native inference engine: shared
+ * libraries staged into `runtime/`, per-accelerator backend modules into `backends/`, a GGUF
+ * planner bundle into `catalog/`, and a Cargo feature graph selecting CUDA, Metal, or Vulkan.
+ * None of that exists now — inference happens in an EIM container, so there is one binary and
+ * one acceleration story, and what the container can use is discovered at runtime by the Docker
+ * preflight rather than chosen at compile time.
+ *
+ * The layout still matches what the client's development binary resolution expects: it derives
+ * `bin/magnitude-icn` from the directory holding `installation.json`.
+ */
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-
-export type LocalIcnBackend = "cpu" | "cuda" | "metal" | "vulkan";
-
-export const developmentBuildEnvironment = (
-  backend: LocalIcnBackend
-): Readonly<Record<string, string>> => ({
-  ...(backend === "cpu" ? {} : { LLAMA_CPU_ALL_VARIANTS: "0" }),
-  ...(backend === "cuda" ? { CMAKE_CUDA_ARCHITECTURES: "native" } : {}),
-});
-
-export const developmentBuildProfile = (backend: LocalIcnBackend): string =>
-  `development-${backend}${backend === "cuda" ? "-native" : ""}`;
-
-const executableExists = async (name: string): Promise<boolean> => {
-  const path = Bun.which(name);
-  if (!path) return false;
-  return access(path, constants.X_OK).then(
-    () => true,
-    () => false
-  );
-};
-
-const commandSucceeds = async (
-  command: readonly string[]
-): Promise<boolean> => {
-  const child = Bun.spawn([...command], { stdout: "ignore", stderr: "ignore" });
-  return (await child.exited) === 0;
-};
-
-const selectBackend = async (): Promise<LocalIcnBackend> => {
-  const requested = process.env.MAGNITUDE_ICN_BACKEND?.trim().toLowerCase();
-  if (requested && !["cpu", "cuda", "metal", "vulkan"].includes(requested)) {
-    throw new Error(
-      "MAGNITUDE_ICN_BACKEND must be cpu, cuda, metal, or vulkan"
-    );
-  }
-  if (
-    requested === "metal" &&
-    (process.platform !== "darwin" || process.arch !== "arm64")
-  ) {
-    throw new Error("Metal development builds require Apple Silicon");
-  }
-  if (requested === "cuda" && !(await executableExists("nvcc"))) {
-    throw new Error("CUDA development builds require nvcc");
-  }
-  if (requested) return requested as LocalIcnBackend;
-  if (process.platform === "darwin" && process.arch === "arm64") return "metal";
-  if (
-    process.platform === "linux" &&
-    (await executableExists("nvcc")) &&
-    (await commandSucceeds(["nvidia-smi", "-L"]))
-  )
-    return "cuda";
-  return "cpu";
-};
+const MANIFEST = resolve(PROJECT_ROOT, "inference/Cargo.toml");
 
 const run = async (
   command: readonly string[],
-  environment: Readonly<Record<string, string | undefined>> = process.env
-): Promise<void> => {
+  options: { readonly captureStdout?: boolean } = {}
+): Promise<string> => {
   const child = Bun.spawn([...command], {
     cwd: PROJECT_ROOT,
-    env: environment,
     stdin: "ignore",
-    stdout: "inherit",
+    stdout: options.captureStdout ? "pipe" : "inherit",
     stderr: "inherit",
   });
+  const stdout = options.captureStdout
+    ? await new Response(child.stdout).text()
+    : "";
   const code = await child.exited;
   if (code !== 0) {
     throw new Error(
       `command failed with exit code ${code}: ${command.join(" ")}`
     );
   }
+  return stdout;
 };
 
+const executableName = (): string =>
+  process.platform === "win32" ? "magnitude-icn.exe" : "magnitude-icn";
+
 export const buildLocalIcn = async (): Promise<{
-  readonly backend: LocalIcnBackend;
   readonly installationPath: string;
+  readonly binaryPath: string;
 }> => {
-  const backend = await selectBackend();
-  await run(["bun", "run", "icn:catalog:build-bundle"]);
-  console.log(
-    `[dev] Building ${backend} ICN${backend === "cuda" ? " for attached GPU(s)" : ""}...`
+  console.log("[dev] Building ICN...");
+  await run([
+    "cargo",
+    "build",
+    "--manifest-path",
+    MANIFEST,
+    "--package",
+    "icn-server",
+  ]);
+
+  const built = resolve(
+    PROJECT_ROOT,
+    "inference/target/debug",
+    executableName()
   );
-  const build = await buildIcnBinary({
-    target: getDefaultBunTarget(),
-    profile: developmentBuildProfile(backend),
-    features: [
-      "mtmd",
-      "dynamic-backends",
-      ...(backend === "cpu" ? [] : [backend === "cuda" ? "cuda" : backend]),
-    ],
-    release: false,
-    clean: false,
-    buildEnvironment: developmentBuildEnvironment(backend),
-  });
+  // The declaration must describe the binary that will actually run, so read it from the binary
+  // rather than recomputing the pins here and risking a mismatch.
+  const identity = JSON.parse(await run([built, "version", "--json"], {
+    captureStdout: true,
+  })) as {
+    readonly native_build: string;
+    readonly backend_module_abi: string;
+  };
+
   const target = resolve(PROJECT_ROOT, "inference/target");
   const staging = await mkdtemp(resolve(target, ".development-"));
   const destination = resolve(target, "development");
   try {
-    for (const directory of ["bin", "runtime", "backends", "catalog"]) {
-      await mkdir(resolve(staging, directory), {
-        recursive: true,
-        mode: 0o700,
-      });
+    // `runtime` stays as an empty directory: there are no native libraries to stage, but the
+    // client still points a loader path at it and an existing directory keeps that harmless.
+    for (const directory of ["bin", "runtime"]) {
+      await mkdir(resolve(staging, directory), { recursive: true, mode: 0o700 });
     }
-    const executable =
-      process.platform === "win32" ? "magnitude-icn.exe" : "magnitude-icn";
-    await copyFile(build.binary, resolve(staging, "bin", executable));
-    for (const source of build.runtimeLibraries) {
-      await copyFile(source, resolve(staging, "runtime", basename(source)));
-    }
-    const modules = build.backendModules.filter((source) => {
-      const name = basename(source).toLowerCase();
-      return (
-        name.includes("cpu") || (backend !== "cpu" && name.includes(backend))
-      );
-    });
-    if (
-      !modules.some((source) =>
-        basename(source).toLowerCase().includes("cpu")
-      ) ||
-      (backend !== "cpu" &&
-        !modules.some((source) =>
-          basename(source).toLowerCase().includes(backend)
-        ))
-    ) {
-      throw new Error(`development build did not emit the ${backend} backend`);
-    }
-    for (const source of modules) {
-      await copyFile(source, resolve(staging, "backends", basename(source)));
-    }
-    await copyFile(
-      resolve(target, "catalog-inputs/model-planner-inputs.bundle"),
-      resolve(staging, "catalog/model-planner-inputs.bundle")
+    await Bun.write(
+      Bun.file(resolve(staging, "bin", executableName())),
+      Bun.file(built)
     );
+    // Bun.write does not preserve the executable bit.
+    await run(["chmod", "755", resolve(staging, "bin", executableName())]);
+
     const installation = resolve(staging, "installation.json");
     await writeFile(
       installation,
       `${Schema.encodeSync(Schema.parseJson(IcnInstallationDeclaration))({
         schemaVersion: 1,
-        backend,
-        nativeBuild: build.identity.native_build,
-        backendModuleAbi: build.identity.backend_module_abi,
+        // One backend now, and `cpu` is the honest name for it: vLLM in the EIM image serves
+        // from system memory on Xeon cores. The variant is retained rather than renamed because
+        // it crosses the generated protocol.
+        backend: "cpu",
+        nativeBuild: identity.native_build,
+        backendModuleAbi: identity.backend_module_abi,
       })}\n`
     );
+
     await rm(destination, { recursive: true, force: true });
     await rename(staging, destination);
     return {
-      backend,
       installationPath: resolve(destination, "installation.json"),
+      binaryPath: resolve(destination, "bin", executableName()),
     };
   } catch (cause) {
     await rm(staging, { recursive: true, force: true });
@@ -177,25 +119,9 @@ export const buildLocalIcn = async (): Promise<{
 if (import.meta.main) {
   const result = await buildLocalIcn();
   if (process.argv.includes("--serve")) {
-    const executable =
-      process.platform === "win32" ? "magnitude-icn.exe" : "magnitude-icn";
-    const environment = process.platform === "win32"
-      ? {
-        ...process.env,
-        PATH: [
-          resolve(PROJECT_ROOT, "inference/target/development/runtime"),
-          process.env.PATH,
-        ].filter(Boolean).join(delimiter),
-      }
-      : {
-        ...process.env,
-        ...(process.platform === "darwin"
-          ? { DYLD_LIBRARY_PATH: "" }
-          : { LD_LIBRARY_PATH: "" }),
-      };
     const child = Bun.spawn(
       [
-        resolve(PROJECT_ROOT, "inference/target/development/bin", executable),
+        result.binaryPath,
         "serve",
         "--installation",
         result.installationPath,
@@ -203,7 +129,7 @@ if (import.meta.main) {
       ],
       {
         cwd: PROJECT_ROOT,
-        env: environment,
+        env: process.env,
         stdin: "inherit",
         stdout: "inherit",
         stderr: "inherit",

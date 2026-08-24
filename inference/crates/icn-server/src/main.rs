@@ -26,6 +26,7 @@ use icn_contracts::bootstrap_protocol::{
     IcnStartupRecordType,
 };
 use icn_contracts::{HardwareProvider, HardwareSnapshot, InventoryError};
+use icn_eim::catalog::{DockerImageProbe, EimCatalog, EimDownloads};
 use icn_eim::controller::{EimControllerConfig, EimModelDefinition, EimModelInstanceController};
 use icn_eim::docker::cli::ProxySettings;
 use icn_eim::docker::{DockerCli, DockerPreflight};
@@ -173,6 +174,8 @@ async fn main() -> anyhow::Result<()> {
             );
 
             let mut controller = None;
+            let mut catalog = None;
+            let mut downloads = None;
             let mut state = if fake {
                 AppState::new(FakeBackend::new("icn-fake", "Hello from ICN."))
             } else {
@@ -197,7 +200,7 @@ async fn main() -> anyhow::Result<()> {
                 );
 
                 let eim = Arc::new(EimModelInstanceController::new(
-                    docker,
+                    docker.clone(),
                     definitions,
                     EimControllerConfig {
                         icn_instance_id: instance_id.clone(),
@@ -215,6 +218,13 @@ async fn main() -> anyhow::Result<()> {
                 if !reaped.is_empty() {
                     tracing::info!(?reaped, "removed orphaned containers");
                 }
+                // ACN calls GET /v1/models while building its layer graph and fails to become
+                // ready if it errors, so the catalog is not optional.
+                catalog = Some(Arc::new(EimCatalog::new(
+                    eim.definitions(),
+                    Arc::new(DockerImageProbe::new(docker)),
+                )));
+                downloads = Some(Arc::new(EimDownloads));
                 controller = Some(eim);
                 AppState::model_free()
             }
@@ -229,6 +239,17 @@ async fn main() -> anyhow::Result<()> {
                 native_build: eim_build.clone(),
             });
 
+            if let Some(catalog) = catalog {
+                // The same catalog answers all three model surfaces the client polls, so they
+                // can never describe different models.
+                state = state
+                    .with_catalog_models(catalog.clone())
+                    .with_recommendable_catalog(catalog.clone())
+                    .with_installed_packages(catalog);
+            }
+            if let Some(downloads) = downloads {
+                state = state.with_model_downloads(downloads);
+            }
             if let Some(controller) = controller {
                 state = state.with_model_controller(controller);
             }

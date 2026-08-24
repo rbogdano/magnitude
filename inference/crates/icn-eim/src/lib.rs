@@ -8,7 +8,9 @@
 //!
 //! Module map:
 //!   - `backend`  — CompletionBackend over the container's chat-completions endpoint
+//!   - `catalog`  — the model catalog ICN publishes; ACN cannot start without it
 //!   - `controller` — ModelInstanceController: one resident container, load/stop/lease
+//!   - `package`  — package identity derived from the serving image rather than a file path
 //!   - `env_contract` — the INFERENCE_* launch contract, including the tool-call parser
 //!   - `docker`  — the container driver: `docker` CLI invocations, never scraping human output
 //!   - `estimate` — model fit from catalog geometry, replacing the native `common/fit` planner
@@ -19,11 +21,13 @@
 //!   - `sse`      — server-sent event framing and OpenAI chat-chunk decoding
 
 pub mod backend;
+pub mod catalog;
 pub mod controller;
 pub mod docker;
 pub mod env_contract;
 pub mod estimate;
 pub mod memory;
+pub mod package;
 pub mod properties;
 pub mod readiness;
 pub mod request;

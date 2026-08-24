@@ -49,14 +49,28 @@ use crate::readiness::{
 ///
 /// Stage 2 builds these from the EIM catalog plus the geometry overlay; stage 1 accepts them
 /// directly so the container path can be exercised before the catalog exists.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EimModelDefinition {
     pub configuration_id: ModelServingConfigurationId,
     pub package_id: ModelPackageId,
     pub catalog_model_id: String,
+    /// Catalog variant, e.g. `vllm-bf16:tp2`. Two `:`-separated components, which the client's
+    /// schema enforces.
+    pub catalog_variant_id: String,
     /// Hugging Face repository identifier, also `INFERENCE_MODEL_ID`.
     pub canonical_name: String,
+    pub display_name: String,
+    /// Shown beside the display name. Always `bf16` today: every shipped EIM profile is bf16.
+    pub variant_label: String,
+    pub description: String,
+    /// `YYYY-MM-DD`. The client rejects anything that is not a real calendar date.
+    pub release_date: String,
+    pub license: String,
+    /// Agentic capability, curated rather than measured here. The provenance string says so,
+    /// because claiming a Terminal-Bench number this fork never ran would be a fabrication.
+    pub quality_score: f64,
+    pub quality_score_provenance: String,
     /// Fully qualified serving image reference.
     pub image: String,
     pub eim_profile_id: String,
@@ -299,6 +313,12 @@ impl EimModelInstanceController {
                 }
             }
         });
+    }
+
+    /// The model table, shared with the catalog so both describe the same models.
+    #[must_use]
+    pub fn definitions(&self) -> Arc<BTreeMap<ModelServingConfigurationId, EimModelDefinition>> {
+        Arc::clone(&self.shared.definitions)
     }
 
     /// Removes containers left behind by a previous, no-longer-running ICN.
@@ -1183,6 +1203,14 @@ mod tests {
             configuration_id: ModelServingConfigurationId("eim-qwen3-8b-ctx32768".to_owned()),
             package_id: ModelPackageId("eim--Qwen--Qwen3-8B--v1".to_owned()),
             catalog_model_id: "qwen-qwen3-8b".to_owned(),
+            catalog_variant_id: "vllm-bf16:tp2".to_owned(),
+            display_name: "Qwen3 8B".to_owned(),
+            variant_label: "bf16".to_owned(),
+            description: "Dense model from the Qwen3 series.".to_owned(),
+            release_date: "2025-04-29".to_owned(),
+            license: "Apache-2.0".to_owned(),
+            quality_score: 24.0,
+            quality_score_provenance: "curated_public_benchmarks".to_owned(),
             canonical_name: "Qwen/Qwen3-8B".to_owned(),
             image: "magnitude-eim-xeon-qwen-qwen3-8b:v1".to_owned(),
             eim_profile_id: "vllm-xeon-bf16-tp2".to_owned(),
