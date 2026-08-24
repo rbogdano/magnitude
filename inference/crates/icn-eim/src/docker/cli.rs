@@ -172,6 +172,19 @@ pub struct ContainerSpec {
     pub memory_limit_bytes: Option<u64>,
     /// Seconds `docker stop` waits before `SIGKILL`. vLLM is PID 1 via `os.execv`.
     pub stop_timeout_seconds: u32,
+    /// Shared memory for the container, in bytes.
+    ///
+    /// Docker defaults to 64 MB, which is far too little for tensor parallelism: vLLM's workers
+    /// broadcast through shared memory and `shm_broadcast` fails to start, surfacing only as a
+    /// gloo "connection closed by peer" from the surviving worker. Observed on a real Xeon with
+    /// `tensor-parallel-size: 2`.
+    pub shm_size_bytes: Option<u64>,
+    /// Linux capabilities to add.
+    ///
+    /// `SYS_NICE` is what lets vLLM bind worker memory to a NUMA node; without it every worker
+    /// logs `numa_migrate_pages failed. errno: 1` and runs unbound, which on a multi-socket host
+    /// costs the cross-socket bandwidth the tensor-parallel split existed to avoid.
+    pub capabilities: Vec<String>,
     /// Command arguments. Empty means EIM's default `serve`.
     pub command: Vec<String>,
 }
@@ -202,6 +215,14 @@ impl ContainerSpec {
         }
         args.push("--stop-timeout".to_owned());
         args.push(self.stop_timeout_seconds.to_string());
+        if let Some(shm_size) = self.shm_size_bytes {
+            args.push("--shm-size".to_owned());
+            args.push(shm_size.to_string());
+        }
+        for capability in &self.capabilities {
+            args.push("--cap-add".to_owned());
+            args.push(capability.clone());
+        }
         for mount in &self.mounts {
             args.push("--volume".to_owned());
             args.push(mount.clone());
@@ -520,6 +541,8 @@ mod tests {
             mounts: vec!["/var/lib/magnitude/eim:/workspace/model-cache:ro".to_owned()],
             memory_limit_bytes: Some(83_000_000_000),
             stop_timeout_seconds: 30,
+            shm_size_bytes: Some(16 * 1024 * 1024 * 1024),
+            capabilities: vec!["SYS_NICE".to_owned()],
             command: Vec::new(),
         }
     }
@@ -616,6 +639,46 @@ mod tests {
             .expect("image");
 
         assert_eq!(&args[image + 1..], &["dry-run", "--format", "json"]);
+    }
+
+    #[test]
+    fn raises_shared_memory_above_the_docker_default() {
+        let args = spec().to_run_args();
+        let shm = args
+            .iter()
+            .position(|arg| arg == "--shm-size")
+            .map(|index| args[index + 1].parse::<u64>().expect("a byte count"))
+            .expect("a shared memory size");
+
+        // Docker's 64 MB default makes vLLM's tensor-parallel shm_broadcast fail to start, and
+        // the only symptom is a gloo "connection closed by peer" from the surviving worker.
+        assert!(shm > 64 * 1024 * 1024, "{shm}");
+    }
+
+    #[test]
+    fn adds_the_capability_numa_binding_needs() {
+        let args = spec().to_run_args();
+        let index = args
+            .iter()
+            .position(|arg| arg == "--cap-add")
+            .expect("a capability");
+
+        // Without SYS_NICE every worker logs `numa_migrate_pages failed. errno: 1` and runs
+        // unbound, losing the locality the tensor-parallel split was for.
+        assert_eq!(args[index + 1], "SYS_NICE");
+    }
+
+    #[test]
+    fn omits_shared_memory_and_capabilities_when_unset() {
+        let plain = ContainerSpec {
+            shm_size_bytes: None,
+            capabilities: Vec::new(),
+            ..spec()
+        };
+        let args = plain.to_run_args();
+
+        assert!(!args.contains(&"--shm-size".to_owned()));
+        assert!(!args.contains(&"--cap-add".to_owned()));
     }
 
     #[test]

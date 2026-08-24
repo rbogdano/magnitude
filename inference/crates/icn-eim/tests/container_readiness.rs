@@ -101,6 +101,9 @@ fn spec(
         mounts: Vec::new(),
         memory_limit_bytes: None,
         stop_timeout_seconds: 5,
+        // The stub is single-process, so neither is needed here; the real launch sets both.
+        shm_size_bytes: None,
+        capabilities: Vec::new(),
         command: vec!["python".to_owned(), "-c".to_owned(), STUB_SERVER.to_owned()],
     }
 }

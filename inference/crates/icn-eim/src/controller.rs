@@ -128,6 +128,13 @@ pub struct EimControllerConfig {
     /// slightly low estimate does not OOM a healthy container, but bounded so a runaway one is
     /// killed instead of taking the host down.
     pub memory_limit_percent: u64,
+    /// Shared memory for the container. Docker's 64 MB default breaks tensor parallelism:
+    /// vLLM's workers broadcast through shared memory, and the failure surfaces only as a gloo
+    /// "connection closed by peer" from the worker that survived.
+    pub shm_size_bytes: u64,
+    /// How many NUMA nodes the host exposes, used to size the per-node memory reservation vLLM
+    /// asks for. Zero means unknown, which makes the reservation fall back to its ceiling.
+    pub numa_nodes: u32,
 }
 
 impl Default for EimControllerConfig {
@@ -140,6 +147,8 @@ impl Default for EimControllerConfig {
             readiness: ReadinessConfig::default(),
             offline_weights: false,
             memory_limit_percent: 115,
+            shm_size_bytes: 16 * 1024 * 1024 * 1024,
+            numa_nodes: 1,
         }
     }
 }
@@ -851,6 +860,20 @@ async fn run_load(shared: Shared, request: LoadModelRequest, events: mpsc::Sende
     };
     let container = container_name(&shared.config.icn_instance_id, &request.instance_id.0);
 
+    // vLLM's CPU backend reserves a fraction of each NUMA node rather than an absolute size,
+    // and its default of 0.92 fails on a host with anything else resident. No shipped EIM
+    // profile sets it, so the reservation is derived from the estimate here.
+    let node_capacity_bytes = if shared.config.numa_nodes > 1 {
+        budget.stable_capacity_bytes / u64::from(shared.config.numa_nodes)
+    } else {
+        budget.stable_capacity_bytes
+    };
+    let cpu_utilization = crate::estimate::cpu_memory_utilization(
+        &estimate,
+        shape.tensor_parallel_size,
+        node_capacity_bytes,
+    );
+
     let launch = LaunchEnvironment {
         model_id: definition.canonical_name.clone(),
         profile_id: definition.eim_profile_id.clone(),
@@ -865,6 +888,7 @@ async fn run_load(shared: Shared, request: LoadModelRequest, events: mpsc::Sende
             .flatten(),
         proxy: shared.config.proxy.clone(),
         offline_weights: shared.config.offline_weights,
+        cpu_memory_utilization: Some(cpu_utilization),
         engine_args_override: BTreeMap::new(),
     };
 
@@ -891,6 +915,11 @@ async fn run_load(shared: Shared, request: LoadModelRequest, events: mpsc::Sende
                 / 100,
         ),
         stop_timeout_seconds: 30,
+        shm_size_bytes: Some(shared.config.shm_size_bytes),
+        // Lets vLLM bind worker memory to a NUMA node. Without it every worker logs
+        // `numa_migrate_pages failed` and runs unbound, losing exactly the locality that made
+        // a tensor-parallel split worth doing on a multi-socket host.
+        capabilities: vec!["SYS_NICE".to_owned()],
         command: Vec::new(),
     };
 

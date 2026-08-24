@@ -28,7 +28,7 @@ pub const CONTAINER_CACHE_PATH: &str = "/workspace/model-cache";
 pub const CONTAINER_PORT: u16 = 8000;
 
 /// Everything that varies per launch.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LaunchEnvironment {
     /// Hugging Face repository identifier, e.g. `Qwen/Qwen3-30B-A3B`.
     pub model_id: String,
@@ -53,6 +53,12 @@ pub struct LaunchEnvironment {
     pub proxy: ProxySettings,
     /// Whether the weight cache is mounted read-only, which it is once Magnitude prefetches.
     pub offline_weights: bool,
+    /// The fraction of a NUMA node vLLM should reserve, passed as `--gpu-memory-utilization`.
+    ///
+    /// Misleadingly named: on the CPU backend that flag controls CPU memory. It is also the
+    /// argument that decides whether the container starts at all, because vLLM compares the
+    /// request against currently free memory and defaults to 0.92 of every node.
+    pub cpu_memory_utilization: Option<f64>,
     /// Additional engine arguments, merged last so an operator can override anything.
     pub engine_args_override: BTreeMap<String, Value>,
 }
@@ -111,6 +117,9 @@ impl LaunchEnvironment {
         }
         if let Some(parser) = &self.reasoning_parser {
             args.insert("reasoning-parser".into(), json!(parser));
+        }
+        if let Some(utilization) = self.cpu_memory_utilization {
+            args.insert("gpu-memory-utilization".into(), json!(utilization));
         }
 
         for (name, value) in &self.engine_args_override {
@@ -201,6 +210,7 @@ mod tests {
             hf_token: None,
             proxy: ProxySettings::default(),
             offline_weights: true,
+            cpu_memory_utilization: Some(0.25),
             engine_args_override: BTreeMap::new(),
         }
     }
@@ -257,6 +267,30 @@ mod tests {
         assert_eq!(args["enable-auto-tool-choice"], json!(true));
         assert_eq!(args["tool-call-parser"], json!("hermes"));
         assert_eq!(args["reasoning-parser"], json!("qwen3"));
+    }
+
+    #[test]
+    fn reserves_cpu_memory_explicitly_rather_than_taking_the_default() {
+        // vLLM's default asks for 92% of every NUMA node and refuses to start on a host that is
+        // doing anything else. Observed on a real Xeon: 115.87 GiB wanted, 115.08 GiB free.
+        assert_eq!(
+            engine_args(&launch())["gpu-memory-utilization"],
+            json!(0.25)
+        );
+    }
+
+    #[test]
+    fn omits_the_reservation_when_it_is_not_known() {
+        let unknown = LaunchEnvironment {
+            cpu_memory_utilization: None,
+            ..launch()
+        };
+
+        assert!(
+            engine_args(&unknown)
+                .get("gpu-memory-utilization")
+                .is_none()
+        );
     }
 
     #[test]

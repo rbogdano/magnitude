@@ -13,6 +13,7 @@ import {
   catalogInspectorActions,
   catalogStatus,
   catalogLocalModels,
+  catalogUnserveableStatus,
   huggingFaceRepositoryUrls,
   localModelInstalledStatus,
   localModelReadinessStatus,
@@ -80,18 +81,58 @@ describe("unified models menu projection", () => {
     expect(entries[0]).toMatchObject({ _tag: "Local", model: installed })
   })
 
-  it("includes only fitting catalog rows in Catalog", () => {
+  it("keeps a catalog row that cannot be served here, so its reason stays visible", () => {
+    // The catalog is where a model's requirements are supposed to be legible. Dropping the ones
+    // that do not fit would hide most of a container-backed catalog and leave the user with no
+    // way to learn why a model is missing.
     const catalogFit = makeCatalogOnlyModel()
-    const nonCatalogFit = makeModel({
+    const doesNotFit = withDoesNotFitAssessment(makeCatalogOnlyModel())
+    const notInCatalog = makeModel({
       acquisitionState: { _tag: "NotInstalled", completedBytes: 0, totalBytes: 1 },
     })
-    const models = [
-      catalogFit,
-      nonCatalogFit,
-      withDoesNotFitAssessment(makeCatalogOnlyModel()),
-    ]
 
-    expect(catalogLocalModels(models)).toEqual([catalogFit])
+    expect(catalogLocalModels([catalogFit, notInCatalog, doesNotFit]))
+      .toEqual([catalogFit, doesNotFit])
+  })
+
+  it("still excludes a catalog row that has not been assessed", () => {
+    // An unassessed model has no requirements to show yet, so it has nothing to explain.
+    const resolving = { ...makeCatalogOnlyModel(), servingState: { _tag: "Resolving" as const } }
+
+    expect(catalogLocalModels([resolving])).toEqual([])
+  })
+
+  it("explains why a catalog model cannot be served instead of calling it available", () => {
+    // Reading "Available" next to a model that will never load on this host is misleading.
+    expect(catalogStatus(withDoesNotFitAssessment(makeCatalogOnlyModel()))).toBe("Doesn’t fit")
+    expect(catalogUnserveableStatus(withDoesNotFitAssessment(makeCatalogOnlyModel())))
+      .toBe("Doesn’t fit")
+
+    // A model whose tool calls the engine cannot parse loads and generates text perfectly well,
+    // but is useless to an agent, so it is a capability limit rather than an error.
+    const withoutTools = makeCatalogOnlyModel()
+    if (withoutTools.servingState._tag !== "Assessed") throw new Error("fixture must be assessed")
+    const noToolCalling = {
+      ...withoutTools,
+      servingState: {
+        ...withoutTools.servingState,
+        capabilities: { ...withoutTools.servingState.capabilities, tools: false },
+      },
+    }
+    expect(catalogStatus(noToolCalling)).toBe("No tool calling")
+  })
+
+  it("reports a serveable catalog model as available", () => {
+    expect(catalogUnserveableStatus(makeCatalogOnlyModel())).toBeUndefined()
+    expect(catalogStatus(makeCatalogOnlyModel())).toBe("Available")
+  })
+
+  it("prefers in-flight acquisition over an unserveable reason", () => {
+    // A download in progress is the more useful thing to show while it is happening.
+    expect(catalogStatus(withDoesNotFitAssessment(makeCatalogOnlyModel()), {
+      _tag: "Starting",
+      operation: "Install",
+    })).toBe("Starting download…")
   })
 
   it("shows download admission before mirrored acquisition begins", () => {

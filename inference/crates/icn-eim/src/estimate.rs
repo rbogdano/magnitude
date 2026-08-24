@@ -171,6 +171,51 @@ impl HostBudget {
     }
 }
 
+/// Headroom above the estimate when telling vLLM how much of a NUMA node to reserve.
+///
+/// The estimate is a model of allocation, not a measurement of it, so the reservation is asked
+/// for with margin. Too tight and the engine runs out mid-load; too loose and it refuses to
+/// start because the node does not have that much free.
+const CPU_UTILIZATION_SAFETY_NUMERATOR: u64 = 3;
+const CPU_UTILIZATION_SAFETY_DENOMINATOR: u64 = 2;
+
+/// Never reserve less than this fraction of a node: vLLM needs room for its own bookkeeping
+/// beyond what the model accounts for.
+const MINIMUM_CPU_UTILIZATION: f64 = 0.05;
+/// Never ask for more than this. vLLM compares the request against *currently free* memory, so
+/// asking for nearly the whole node fails on any host that is doing anything else at all --
+/// which is exactly how the default of 0.92 fails on an almost idle machine.
+const MAXIMUM_CPU_UTILIZATION: f64 = 0.85;
+
+/// The fraction of one NUMA node vLLM should reserve, for `--gpu-memory-utilization`.
+///
+/// Despite the name, that flag controls CPU memory on the CPU backend, and it is a fraction of
+/// a *node* rather than an absolute size. This is the value that actually decides whether a
+/// container starts: vLLM's default of 0.92 asks for 92% of every node and fails on a host with
+/// anything else resident. No shipped EIM profile sets it.
+///
+/// With `distributed-executor-backend: mp` each tensor-parallel rank binds one node and holds
+/// its shard, so the per-node requirement is the estimate divided by the rank count.
+#[must_use]
+pub fn cpu_memory_utilization(
+    estimate: &MemoryEstimate,
+    tensor_parallel_size: u32,
+    node_capacity_bytes: u64,
+) -> f64 {
+    if node_capacity_bytes == 0 {
+        return MAXIMUM_CPU_UTILIZATION;
+    }
+    let ranks = u64::from(tensor_parallel_size.max(1));
+    let per_node = estimate
+        .required_bytes
+        .div_ceil(ranks)
+        .saturating_mul(CPU_UTILIZATION_SAFETY_NUMERATOR)
+        / CPU_UTILIZATION_SAFETY_DENOMINATOR;
+
+    let fraction = per_node as f64 / node_capacity_bytes as f64;
+    fraction.clamp(MINIMUM_CPU_UTILIZATION, MAXIMUM_CPU_UTILIZATION)
+}
+
 /// A model is `Recommended` only when it leaves comfortable headroom; at 70% or more of the
 /// budget it still loads, but the user is told it is tight.
 const CONSTRAINED_UTILIZATION_NUMERATOR: u64 = 7;
@@ -329,6 +374,101 @@ mod tests {
             context_tokens,
             parallel_sequences: 1,
             tensor_parallel_size,
+        }
+    }
+
+    /// What the Xeon 6767P reports per NUMA node: vLLM's own error message named
+    /// 125.94 GiB, which is half of the host's 251 GiB.
+    const NODE_CAPACITY_BYTES: u64 = 135_236_616_192;
+
+    #[test]
+    fn reserves_a_node_fraction_sized_to_the_model_rather_than_the_host() {
+        // The default of 0.92 asks for 92% of a node and fails on an almost idle machine; that
+        // is the failure this exists to prevent.
+        let estimate = MemoryEstimate::compute(&qwen3_8b(), &shape(32_768, 2));
+        let utilization = cpu_memory_utilization(&estimate, 2, NODE_CAPACITY_BYTES);
+
+        assert!(utilization > 0.05, "{utilization}");
+        assert!(
+            utilization < 0.3,
+            "an 8B model needs a small slice of a 135 GB node: {utilization}"
+        );
+    }
+
+    #[test]
+    fn a_larger_model_reserves_a_larger_fraction() {
+        let small = cpu_memory_utilization(
+            &MemoryEstimate::compute(&qwen3_8b(), &shape(32_768, 2)),
+            2,
+            NODE_CAPACITY_BYTES,
+        );
+        let large = cpu_memory_utilization(
+            &MemoryEstimate::compute(&qwen3_30b_a3b(), &shape(32_768, 2)),
+            2,
+            NODE_CAPACITY_BYTES,
+        );
+
+        assert!(large > small, "small={small} large={large}");
+    }
+
+    #[test]
+    fn more_ranks_reserve_less_of_each_node() {
+        // Each rank binds one node and holds only its shard.
+        let estimate = MemoryEstimate::compute(&qwen3_30b_a3b(), &shape(32_768, 2));
+        let one_rank = cpu_memory_utilization(&estimate, 1, NODE_CAPACITY_BYTES);
+        let two_ranks = cpu_memory_utilization(&estimate, 2, NODE_CAPACITY_BYTES);
+
+        assert!(two_ranks < one_rank, "one={one_rank} two={two_ranks}");
+    }
+
+    #[test]
+    fn never_asks_for_nearly_a_whole_node() {
+        // A model far larger than a node must still produce a request vLLM can satisfy against
+        // free memory rather than one guaranteed to be refused.
+        let enormous = MemoryEstimate::compute(&llama4_scout(), &shape(32_768, 1));
+
+        assert_eq!(
+            cpu_memory_utilization(&enormous, 1, NODE_CAPACITY_BYTES),
+            MAXIMUM_CPU_UTILIZATION
+        );
+    }
+
+    #[test]
+    fn never_asks_for_a_sliver() {
+        let tiny = ModelGeometry {
+            total_parameters: 100_000_000,
+            active_parameters: 100_000_000,
+            ..qwen3_8b()
+        };
+        let utilization = cpu_memory_utilization(
+            &MemoryEstimate::compute(&tiny, &shape(2_048, 1)),
+            1,
+            NODE_CAPACITY_BYTES,
+        );
+
+        assert!(utilization >= MINIMUM_CPU_UTILIZATION);
+    }
+
+    #[test]
+    fn falls_back_to_the_ceiling_when_node_capacity_is_unknown() {
+        let estimate = MemoryEstimate::compute(&qwen3_8b(), &shape(32_768, 2));
+
+        assert_eq!(
+            cpu_memory_utilization(&estimate, 2, 0),
+            MAXIMUM_CPU_UTILIZATION
+        );
+    }
+
+    fn qwen3_8b() -> ModelGeometry {
+        ModelGeometry {
+            total_parameters: 8_200_000_000,
+            active_parameters: 8_200_000_000,
+            num_hidden_layers: 36,
+            num_key_value_heads: 8,
+            head_dim: 128,
+            max_position_embeddings: 40_960,
+            sliding_window: None,
+            vision: false,
         }
     }
 

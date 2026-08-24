@@ -408,12 +408,21 @@ export const buildModelsMenuEntries = (
   ]
 }
 
+/**
+ * Every catalog model, whether or not it can be served here.
+ *
+ * A model that does not fit, is gated without a credential, or cannot have its tool calls
+ * parsed stays listed with a status explaining why. Filtering those out instead would hide
+ * most of a container-backed catalog and leave the user with no way to learn what happened —
+ * the catalog is the surface where a model's requirements are supposed to be visible.
+ *
+ * `Assessed` is still required: an unassessed model has no requirements to show yet.
+ */
 export const catalogLocalModels = (
   models: readonly LocalModel[],
 ): readonly LocalModel[] => models.filter((model) =>
   model.catalogMembershipState._tag === "InCatalog"
-  && model.servingState._tag === "Assessed"
-  && model.servingState.assessment._tag === "Fits")
+  && model.servingState._tag === "Assessed")
 
 export type ModelsMenuSelectionAction =
   | {
@@ -1213,6 +1222,27 @@ export const huggingFaceRepositoryUrls = (
     : [],
 ))]
 
+/**
+ * Why a catalog model cannot be served here, or `undefined` when it can.
+ *
+ * Both cases are ordinary for a container-backed catalog. A model larger than the host is
+ * rejected by the memory estimate before anything is downloaded, and a model whose tool calls
+ * the engine cannot parse is unusable to an agent even though it would load and generate text
+ * perfectly well.
+ */
+export const catalogUnserveableStatus = (
+  model: LocalModel,
+): string | undefined => {
+  if (model.servingState._tag !== "Assessed") return undefined
+  const { assessment, capabilities } = model.servingState
+  if (assessment._tag === "Incompatible") return "Incompatible"
+  if (assessment._tag === "DoesNotFit") return "Doesn’t fit"
+  // Without tool calling the model can still hold a conversation, so this is a capability
+  // limit rather than an error.
+  if (!capabilities.tools) return "No tool calling"
+  return undefined
+}
+
 export const catalogStatus = (
   model: LocalModel,
   reconciliationState: CatalogModelReconciliationState = { _tag: "Idle" },
@@ -1230,6 +1260,11 @@ export const catalogStatus = (
   if (reconciliationState._tag === "Failed") {
     return reconciliationState.operation === "Update" ? "Update failed" : "Download failed"
   }
+  // Why a model cannot be served outranks what could be done with it: a user reading
+  // "Available" next to a model that will never load on this host has been misled.
+  const unserveable = catalogUnserveableStatus(model)
+  if (unserveable !== undefined) return unserveable
+
   const acquisitionState = model.acquisitionState
   if (model.upgradeState._tag === "Available") return "Update available"
   if (model.upgradeState._tag === "Failed") return "Update failed"
