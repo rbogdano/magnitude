@@ -29,6 +29,7 @@ use icn_contracts::{HardwareProvider, HardwareSnapshot, InventoryError};
 use icn_eim::acquisition::{
     AcquisitionContext, CatalogAcquisition, DockerAcquisition, EimAcquisitions,
 };
+use icn_eim::assessor::{AssessmentHost, EimModelAssessor};
 use icn_eim::catalog::{EimCatalog, EimDownloads};
 use icn_eim::controller::{EimControllerConfig, EimModelDefinition, EimModelInstanceController};
 use icn_eim::docker::cli::ProxySettings;
@@ -203,6 +204,7 @@ async fn main() -> anyhow::Result<()> {
             let mut controller = None;
             let mut catalog = None;
             let mut downloads = None;
+            let mut assessor = None;
             let mut state = if fake {
                 AppState::new(FakeBackend::new("icn-fake", "Hello from ICN."))
             } else {
@@ -306,6 +308,26 @@ async fn main() -> anyhow::Result<()> {
                     acquisitions,
                     eim.definitions(),
                 )));
+                // The client gates every offer on an assessment, so without this the picker is
+                // empty and the reason it gives is "assessing models for this machine failed".
+                // Derived from the same discovery that answers `/v1/hardware`, because the client
+                // revalidates the arithmetic against the topology built from it.
+                let assessment_policy = CapacityPolicy::default();
+                let assessment_build = eim_build.clone();
+                let assessment_host = host.clone();
+                assessor = Some(Arc::new(EimModelAssessor::new(
+                    eim.definitions(),
+                    Arc::new(move || {
+                        AssessmentHost::from_snapshot(
+                            &icn_hardware::discover_hardware(
+                                assessment_policy,
+                                assessment_build.clone(),
+                                &assessment_host,
+                            ),
+                            u32::try_from(assessment_host.numa_nodes).unwrap_or(1),
+                        )
+                    }),
+                )));
                 controller = Some(eim);
                 AppState::model_free()
             }
@@ -330,6 +352,9 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(downloads) = downloads {
                 state = state.with_model_downloads(downloads);
+            }
+            if let Some(assessor) = assessor {
+                state = state.with_model_assessor(assessor);
             }
             // Kept for the shutdown path: the state builder consumes the controller, and a
             // detached container has to be released by name once serving ends.

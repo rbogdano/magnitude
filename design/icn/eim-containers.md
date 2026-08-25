@@ -60,6 +60,37 @@ is for is duplicate weights: `openai/gpt-oss-20b` publishes the same parameters 
 Installed therefore means both halves — the serving image is present *and* the weights are
 complete against a recorded manifest. Either alone yields a container that cannot serve.
 
+## Assessment is the gate, not a decoration
+
+`POST /v1/models/assess` decides whether a model is offerable at all: the client's projections
+require `servingState` to be `Assessed`, so an ICN that cannot answer it presents an empty picker
+and the reason "assessing models for this machine failed" — whatever else works.
+
+Two of its requirements live in the client's schema rather than in this contract, and violating
+either makes the whole assessment *undecodable* instead of imprecise, which reads as a model missing
+for no stated reason. `remainingBytes` must be arithmetically exact and `capacityBytes` must equal
+the topology's total for the domain, not its stable capacity. And the performance ladder must be
+non-empty, strictly ascending, and end exactly at the served context.
+
+Both figures therefore come from the same hardware snapshot that answers `GET /v1/hardware`. Two
+independent readings of system memory would differ by whatever was allocated in between.
+
+A failed assessment is cached against a key that includes the installation's build identity but not
+ICN's own code, so an ICN that has been fixed does not by itself invalidate one — clearing the
+client's data directory does. Worth knowing before concluding that a fix did not work.
+
+## Throughput is estimated, and says so
+
+Ranking needs a decode rate before the model has ever run, so it is a memory-bandwidth roofline
+over *active* parameters: a mixture of experts holds every expert resident but streams few per
+token, which is what correctly ranks a 30B mixture above a dense 8B on a bandwidth-bound host.
+
+The bandwidth constant is calibrated from one observation — 29.6 tokens per second for a dense 8.2B
+at two ranks — rather than derived from channel counts and clock speeds, which would be a guess
+wearing a calculation's clothes. One measurement extrapolated across a catalogue is why every sample
+reports low confidence and a deliberately wide interval, and why none of this may be presented as
+observed throughput.
+
 ## Memory is estimated, and vLLM's own control is separate
 
 Fit is computed from six geometry numbers per model, not measured. Weights are charged at their
@@ -157,6 +188,8 @@ configuration mistake is not.
 - At most one instance is present in the snapshot at any time, and a stale instance cannot be leased.
 - Every model in the table appears in the catalog; an unusable one carries a reason and a note.
 - A plain `serve` with no EIM flags publishes the full catalog, because that is how ACN starts ICN.
+- Every catalog model produces an assessment that validates against the published topology; one that
+  does not is a model the client cannot offer or explain.
 - A container that dies during startup is detected from its state within one poll interval, not by
   waiting out the readiness budget.
 - Stopping an instance removes its container, and a restarted ICN reaps what a killed predecessor

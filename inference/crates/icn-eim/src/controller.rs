@@ -108,6 +108,27 @@ impl EimModelDefinition {
     /// two together means they cannot drift apart. And the client cannot start without a catalog,
     /// so requiring a flag for it would make the product broken by default: nothing in the
     /// TypeScript launch path passes one.
+    /// The serving configuration for this model at one context length.
+    ///
+    /// Shared by the catalog and the assessor because the client matches a model's assessment to
+    /// its catalog entry by configuration, and two constructions of it would silently fail to
+    /// correspond.
+    #[must_use]
+    pub fn serving_configuration(
+        &self,
+        context_tokens: u32,
+    ) -> icn_contracts::models::ModelServingConfiguration {
+        icn_contracts::models::ModelServingConfiguration {
+            id: self.configuration_id.clone(),
+            bundle: icn_contracts::models::ServableModelBundle::Standalone {
+                package: crate::package::model_package(self),
+            },
+            profile: icn_contracts::models::ServingProfile {
+                context_length: context_tokens,
+            },
+        }
+    }
+
     pub fn shipped_table() -> Result<Vec<Self>, String> {
         Self::parse_table(
             include_str!("../../../eim/models.json"),
