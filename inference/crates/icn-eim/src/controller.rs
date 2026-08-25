@@ -560,6 +560,17 @@ impl Shared {
         self.bump_revision();
     }
 
+    /// Stops and removes a container whose instance is already out of the state.
+    ///
+    /// Used when replacing a resident: the outgoing instance is taken from the state at admission,
+    /// so there is nothing left to transition and only the container needs removing.
+    async fn retire(&self, previous: Resident) {
+        // vLLM is PID 1 through `os.execv`, so SIGTERM reaches it directly and a real shutdown
+        // window is worth giving.
+        let _ = self.docker.stop(&previous.container_name, 30).await;
+        let _ = self.docker.remove(&previous.container_name).await;
+    }
+
     fn fail(&self, failure: ModelInstanceFailure) {
         self.set_lifecycle(ModelInstanceLifecycle::Failed { failure });
     }
@@ -714,9 +725,45 @@ impl ModelInstanceController for EimModelInstanceController {
         // events accumulate; the canonical state is the snapshot regardless.
         let (events, receiver) = mpsc::channel(32);
 
+        // Registered here, synchronously, before the stream is returned. The client polls
+        // `GET /v1/models/instances` as soon as this call answers and requires the admitted
+        // instance to be present; registering it from the spawned task instead let that poll
+        // observe nothing, and the load was rejected with "the admitted model instance was not
+        // published to its slot" while the container started anyway. Every transition has to be
+        // visible to a client that only polls, which is why the ladder cannot own the first one.
+        // A configuration this ICN does not know is not an instance: nothing is registered for it
+        // and, more importantly, the working resident is not taken away on the strength of a
+        // request that cannot be served.
+        let servable = self.shared.definition(&request.configuration.id).is_ok();
+        let previous = if !servable {
+            None
+        } else {
+            let mut state = self.shared.state.lock().expect("controller state lock");
+            let previous = state.resident.take();
+            state.resident = Some(Resident {
+                instance_id: request.instance_id.clone(),
+                configuration_id: request.configuration.id.clone(),
+                container_name: container_name(
+                    &self.shared.config.icn_instance_id,
+                    &request.instance_id.0,
+                ),
+                lifecycle: ModelInstanceLifecycle::Loading {
+                    stage: ModelLoadStage::Queued,
+                    progress: None,
+                    planned_allocation: None,
+                },
+                backend: None,
+                last_activity: Instant::now(),
+            });
+            previous
+        };
+        if servable {
+            self.shared.bump_revision();
+        }
+
         self.shared.runtime.spawn(async move {
             let _guard = mutation.lock().await;
-            run_load(shared, request, events).await;
+            run_load(shared, request, previous, events).await;
         });
 
         ReceiverStream::new(receiver).boxed()
@@ -871,7 +918,12 @@ impl ModelInstanceController for EimModelInstanceController {
 }
 
 /// The load ladder. Emits progress as it goes and leaves canonical state in the snapshot.
-async fn run_load(shared: Shared, request: LoadModelRequest, events: mpsc::Sender<ModelLoadEvent>) {
+async fn run_load(
+    shared: Shared,
+    request: LoadModelRequest,
+    previous: Option<Resident>,
+    events: mpsc::Sender<ModelLoadEvent>,
+) {
     // A closed receiver means the client stopped reading; the load continues, because ACN
     // deliberately treats the stream as advisory and reads state from the snapshot.
     let emit = |event: ModelLoadEvent| {
@@ -892,6 +944,8 @@ async fn run_load(shared: Shared, request: LoadModelRequest, events: mpsc::Sende
     let definition = match shared.definition(&configuration_id) {
         Ok(definition) => definition,
         Err(error) => {
+            // Nothing was registered for an unknown configuration, and the resident was left
+            // alone, so there is no state to transition -- only a refusal to report.
             emit(ModelLoadEvent::Failed {
                 failure: operation_failure("eim_unknown_configuration", error.to_string(), false),
             })
@@ -913,27 +967,25 @@ async fn run_load(shared: Shared, request: LoadModelRequest, events: mpsc::Sende
                 },
             )
             .required_bytes;
-            emit(ModelLoadEvent::Failed {
-                failure: low_memory_failure(required, &budget, 1),
-            })
-            .await;
+            let failure = low_memory_failure(required, &budget, 1);
+            shared.fail(failure.clone());
+            emit(ModelLoadEvent::Failed { failure }).await;
             return;
         }
     };
     let plan = plan_of(&shape, &estimate);
 
     if definition.hf_token_required && shared.config.hf_token.is_none() {
-        emit(ModelLoadEvent::Failed {
-            failure: operation_failure(
-                "eim_model_gated",
-                format!(
-                    "{} is a gated repository; set HF_TOKEN to use it",
-                    definition.canonical_name
-                ),
-                false,
+        let failure = operation_failure(
+            "eim_model_gated",
+            format!(
+                "{} is a gated repository; set HF_TOKEN to use it",
+                definition.canonical_name
             ),
-        })
-        .await;
+            false,
+        );
+        shared.fail(failure.clone());
+        emit(ModelLoadEvent::Failed { failure }).await;
         return;
     }
 
@@ -957,38 +1009,32 @@ async fn run_load(shared: Shared, request: LoadModelRequest, events: mpsc::Sende
     let image = match outcome {
         Ok(outcome) => outcome.summary().clone(),
         Err(error) => {
-            emit(ModelLoadEvent::Failed {
-                failure: image_failure(&error),
-            })
-            .await;
+            let failure = image_failure(&error);
+            shared.fail(failure.clone());
+            emit(ModelLoadEvent::Failed { failure }).await;
             return;
         }
     };
 
-    // Unloading: one container at a time, so the previous instance terminalizes first.
-    let had_resident = {
-        let state = shared.state.lock().expect("controller state lock");
-        state.resident.is_some()
-    };
-    if had_resident {
+    // Unloading: one container at a time, so the previous instance terminalizes first. It was
+    // taken out of the state at admission, so it is retired by name here rather than through
+    // `release_resident`, which would otherwise tear down the instance being loaded.
+    if let Some(previous) = previous {
         emit(ModelLoadEvent::Progress {
             stage: ModelLoadStage::Unloading,
             fraction: None,
             plan: Some(plan.clone()),
         })
         .await;
-        shared
-            .release_resident(ModelReleaseReason::Replacement)
-            .await;
+        shared.retire(previous).await;
     }
 
     let host_port = match allocate_host_port() {
         Ok(port) => port,
         Err(error) => {
-            emit(ModelLoadEvent::Failed {
-                failure: operation_failure("eim_port_allocation_failed", error, true),
-            })
-            .await;
+            let failure = operation_failure("eim_port_allocation_failed", error, true);
+            shared.fail(failure.clone());
+            emit(ModelLoadEvent::Failed { failure }).await;
             return;
         }
     };
@@ -1532,6 +1578,69 @@ mod tests {
 
         let aliases = controller.aliases.read().expect("lock");
         assert!(aliases.contains("qwen3") && aliases.contains("default"));
+    }
+
+    #[tokio::test]
+    async fn an_admitted_load_is_in_the_snapshot_before_the_stream_is_read() {
+        // The client polls `GET /v1/models/instances` as soon as the load call answers and rejects
+        // the load if the admitted instance is absent -- "the admitted model instance was not
+        // published to its slot". Registering it from the spawned ladder instead let that poll
+        // observe nothing while the container started anyway, so no turn could ever run.
+        let controller = controller();
+        let request = LoadModelRequest {
+            instance_id: ModelInstanceId("mi-1".to_owned()),
+            configuration: icn_contracts::models::ModelServingConfiguration {
+                id: definition().configuration_id,
+                bundle: icn_contracts::models::ServableModelBundle::Standalone {
+                    package: test_package(),
+                },
+                profile: icn_contracts::models::ServingProfile {
+                    context_length: definition().context_tokens,
+                },
+            },
+        };
+
+        let stream = controller.load_instance(request);
+        let snapshot = controller.instances().await;
+        drop(stream);
+
+        let instance = snapshot
+            .instances
+            .first()
+            .expect("the admitted instance must be published before the stream is read");
+        assert_eq!(instance.id, ModelInstanceId("mi-1".to_owned()));
+        assert!(
+            matches!(instance.lifecycle, ModelInstanceLifecycle::Loading { .. }),
+            "{:?}",
+            instance.lifecycle
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unservable_configuration_does_not_disturb_the_resident() {
+        // Taking the resident away on the strength of a request that cannot be served would end a
+        // working session to satisfy a typo.
+        let controller = controller();
+        let stream = controller.load_instance(LoadModelRequest {
+            instance_id: ModelInstanceId("mi-unknown".to_owned()),
+            configuration: icn_contracts::models::ModelServingConfiguration {
+                id: ModelServingConfigurationId("no-such-configuration".to_owned()),
+                bundle: icn_contracts::models::ServableModelBundle::Standalone {
+                    package: test_package(),
+                },
+                profile: icn_contracts::models::ServingProfile {
+                    context_length: 4096,
+                },
+            },
+        });
+        let snapshot = controller.instances().await;
+        drop(stream);
+
+        assert!(
+            snapshot.instances.is_empty(),
+            "an unknown configuration is not an instance: {:?}",
+            snapshot.instances
+        );
     }
 
     #[tokio::test]
