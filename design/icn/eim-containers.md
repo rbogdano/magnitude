@@ -135,8 +135,14 @@ does not fit, is gated without a credential, or has no tool-call parser stays li
 a machine-readable reason and a plain-language note. Omitting it would leave the user unable to
 learn why a model they expected is absent.
 
+This constrains the assessment as well, and getting it wrong hid six models. A model whose tool calls
+the engine cannot parse still *fits* — it loads and holds a conversation — so it is assessed on its
+merits and its limitation travels in `capabilities.tools: false` and its notes. Reporting it
+`Incompatible` instead removed it from every picker, because the client's projections keep only
+`Fits`. An assessment is therefore about capacity, never about desirability.
+
 The onboarding chooser is the exception, deliberately: it is a guided first-run flow rather than a
-catalog browser, and it presents only models that can actually be served.
+catalog browser, and it presents only models it can recommend. The full catalogue is `/models`.
 
 ## Container launch invariants
 
