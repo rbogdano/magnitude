@@ -122,6 +122,27 @@ const providerAvailability = (
   }
 }
 
+/**
+ * The completion bound advertised for a locally served model.
+ *
+ * A share of the window rather than all of it, because prompt and completion share one budget: a
+ * served context of 16384 cannot hold a 16384-token completion *and* the conversation that asked
+ * for it. The agent takes this figure as `max_tokens` verbatim, so advertising the whole window
+ * produced a request the engine must refuse — "This model's maximum context length is 16384 tokens,
+ * however you requested ..." — on the very first turn.
+ *
+ * llama.cpp hid the mistake by truncating at the context edge instead of refusing, so the contract
+ * has always been wrong and only a stricter engine made it visible.
+ *
+ * A quarter, capped: an agent's turn is a few thousand tokens at most, while its conversation and
+ * tool schemas fill the rest — the system prompt alone is already thousands of tokens before the
+ * user types anything. Reserving half the window for one completion would starve the part that
+ * actually grows. The floor keeps a small served context usable rather than advertising a
+ * completion too short to be worth generating.
+ */
+export const localMaxOutputTokens = (contextLength: number): number =>
+  Math.min(8_192, Math.max(1_024, Math.floor(contextLength / 4)))
+
 export const LocalProviderOfferingsLive: Layer.Layer<
   LocalProviderOfferings,
   never,
@@ -208,7 +229,7 @@ export const LocalProviderOfferingsLive: Layer.Layer<
         variantLabel: Option.some(presentation.variantLabel),
         supportedSlots: [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID],
         contextWindow: profile.contextLength,
-        maxOutputTokens: profile.contextLength,
+        maxOutputTokens: localMaxOutputTokens(profile.contextLength),
         memory: bundleInspectable && assessment._tag === "Fits"
           ? Option.some(assessment.assessment.memory)
           : bundleInspectable && assessment._tag === "DoesNotFit"

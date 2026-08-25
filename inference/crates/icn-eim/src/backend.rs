@@ -217,7 +217,11 @@ impl CompletionBackend for EimCompletionBackend {
         on_event: &mut dyn FnMut(InferenceStreamEvent) -> Result<(), InferenceError>,
     ) -> Result<Generation, InferenceError> {
         let timings_per_token = request.timings_per_token;
-        let body = to_vllm_request(&request, &self.served_model_name);
+        let body = to_vllm_request(
+            &request,
+            &self.served_model_name,
+            self.properties.context_tokens,
+        );
         let url = self.chat_completions_url();
         let cancelled = Arc::new(AtomicBool::new(false));
 

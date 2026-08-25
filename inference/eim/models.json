@@ -15,7 +15,7 @@
     "image": "magnitude-eim-xeon-qwen-qwen3-30b-a3b:v1",
     "eimProfileId": "vllm-xeon-bf16-tp2",
     "tensorParallelSize": 2,
-    "contextTokens": 16384,
+    "contextTokens": 32768,
     "geometry": {
       "totalParameters": 30500000000,
       "activeParameters": 3300000000,
@@ -62,7 +62,7 @@
     "image": "magnitude-eim-xeon-openai-gpt-oss-20b:v1",
     "eimProfileId": "vllm-xeon-bf16-tp2",
     "tensorParallelSize": 2,
-    "contextTokens": 16384,
+    "contextTokens": 32768,
     "geometry": {
       "totalParameters": 21000000000,
       "activeParameters": 3600000000,
@@ -110,7 +110,7 @@
     "image": "magnitude-eim-xeon-qwen-qwen3-vl-30b-a3b-instruct:v1",
     "eimProfileId": "vllm-xeon-bf16-tp2",
     "tensorParallelSize": 2,
-    "contextTokens": 16384,
+    "contextTokens": 32768,
     "geometry": {
       "totalParameters": 31100000000,
       "activeParameters": 3300000000,
@@ -603,7 +603,7 @@
     "image": "magnitude-eim-xeon-microsoft-phi-4-reasoning:v1",
     "eimProfileId": "vllm-xeon-bf16-tp2",
     "tensorParallelSize": 2,
-    "contextTokens": 16384,
+    "contextTokens": 32768,
     "geometry": {
       "totalParameters": 14700000000,
       "activeParameters": 14700000000,

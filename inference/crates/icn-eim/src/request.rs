@@ -23,7 +23,11 @@ use serde_json::{Map, Value, json};
 /// Face identifier: vLLM validates the `model` member against its own served name, and EIM's
 /// own test helper carries a comment warning about exactly this mismatch.
 #[must_use]
-pub fn to_vllm_request(request: &ChatRequest, served_model_name: &str) -> Value {
+pub fn to_vllm_request(
+    request: &ChatRequest,
+    served_model_name: &str,
+    served_context_tokens: u32,
+) -> Value {
     let template = &request.template;
 
     let mut body = Map::new();
@@ -37,7 +41,13 @@ pub fn to_vllm_request(request: &ChatRequest, served_model_name: &str) -> Value 
         Value::Array(template.messages.iter().map(to_vllm_message).collect()),
     );
 
-    if request.max_tokens > 0 {
+    // Omitted when it would not leave room for a prompt, rather than forwarded into a certain
+    // refusal. vLLM enforces `prompt + completion <= max-model-len` and rejects the whole request
+    // with "This model's maximum context length is N tokens, however you requested ..."; with the
+    // parameter absent it generates until the window is full, which is what a request for the whole
+    // window means. llama.cpp behaved that way by truncating, so callers were built expecting it.
+    let fits_a_prompt = served_context_tokens == 0 || request.max_tokens < served_context_tokens;
+    if request.max_tokens > 0 && fits_a_prompt {
         body.insert("max_tokens".into(), json!(request.max_tokens));
     }
     body.insert("temperature".into(), json!(request.temperature));
@@ -250,6 +260,9 @@ fn to_chat_template_kwargs(
 
 #[cfg(test)]
 mod tests {
+    /// Comfortably above every `max_tokens` these cases use, so the completion bound is forwarded.
+    const SERVED_CONTEXT: u32 = 32_768;
+
     use super::*;
     use icn_contracts::{
         AllowedToolsMode, AutomaticReasoningBudget, ChatTemplateRequest, ImageInput,
@@ -288,7 +301,11 @@ mod tests {
 
     #[test]
     fn always_streams_and_asks_for_usage() {
-        let body = to_vllm_request(&request(template(vec![user("hi")])), "Qwen/Qwen3-8B");
+        let body = to_vllm_request(
+            &request(template(vec![user("hi")])),
+            "Qwen/Qwen3-8B",
+            SERVED_CONTEXT,
+        );
 
         assert_eq!(body["stream"], json!(true));
         assert_eq!(body["stream_options"]["include_usage"], json!(true));
@@ -298,7 +315,11 @@ mod tests {
     #[test]
     fn uses_the_served_model_name_not_the_catalog_identifier() {
         // vLLM validates `model` against its own served name; EIM's helper warns about this.
-        let body = to_vllm_request(&request(template(vec![user("hi")])), "served-alias");
+        let body = to_vllm_request(
+            &request(template(vec![user("hi")])),
+            "served-alias",
+            SERVED_CONTEXT,
+        );
 
         assert_eq!(body["model"], json!("served-alias"));
     }
@@ -308,7 +329,7 @@ mod tests {
         let mut chat = request(template(vec![user("hi")]));
         chat.cache_prompt = true;
         chat.timings_per_token = true;
-        let body = to_vllm_request(&chat, "m");
+        let body = to_vllm_request(&chat, "m", SERVED_CONTEXT);
 
         // Neither has a vLLM equivalent; sending an unknown member risks a 400.
         assert!(body.get("cache_prompt").is_none());
@@ -316,11 +337,46 @@ mod tests {
     }
 
     #[test]
+    fn omits_a_completion_bound_that_leaves_no_room_for_a_prompt() {
+        // vLLM enforces `prompt + completion <= max-model-len` and refuses the whole request:
+        // "This model's maximum context length is 16384 tokens. However you requested 16384 output
+        // tokens and your prompt contains ...". Omitting the bound means "until the window is full",
+        // which is what was asked for and what llama.cpp did by truncating.
+        let mut chat = request(template(vec![user("hi")]));
+        chat.max_tokens = 16_384;
+
+        let body = to_vllm_request(&chat, "m", 16_384);
+
+        assert!(body.get("max_tokens").is_none(), "{body}");
+    }
+
+    #[test]
+    fn forwards_a_completion_bound_the_window_can_hold() {
+        let mut chat = request(template(vec![user("hi")]));
+        chat.max_tokens = 8_192;
+
+        let body = to_vllm_request(&chat, "m", 16_384);
+
+        assert_eq!(body["max_tokens"], serde_json::json!(8_192));
+    }
+
+    #[test]
+    fn an_unknown_served_context_forwards_the_bound_unchanged() {
+        // Better to let the engine speak than to silently drop a caller's limit on a guess.
+        let mut chat = request(template(vec![user("hi")]));
+        chat.max_tokens = 99_999;
+
+        let body = to_vllm_request(&chat, "m", 0);
+
+        assert_eq!(body["max_tokens"], serde_json::json!(99_999));
+    }
+
+    #[test]
     fn omits_a_zero_seed_and_zero_max_tokens() {
         let mut chat = request(template(vec![user("hi")]));
         chat.seed = 0;
         chat.max_tokens = 0;
-        let body = to_vllm_request(&chat, "m");
+        let body = to_vllm_request(&chat, "m", SERVED_CONTEXT);
 
         // Zero means unset in ICN; forwarding it would pin sampling to seed 0.
         assert!(body.get("seed").is_none());
@@ -330,12 +386,20 @@ mod tests {
     #[test]
     fn forwards_stop_sequences_and_ignore_eos_only_when_set() {
         let mut chat = request(template(vec![user("hi")]));
-        assert!(to_vllm_request(&chat, "m").get("stop").is_none());
-        assert!(to_vllm_request(&chat, "m").get("ignore_eos").is_none());
+        assert!(
+            to_vllm_request(&chat, "m", SERVED_CONTEXT)
+                .get("stop")
+                .is_none()
+        );
+        assert!(
+            to_vllm_request(&chat, "m", SERVED_CONTEXT)
+                .get("ignore_eos")
+                .is_none()
+        );
 
         chat.stop = vec!["\n\n".to_owned()];
         chat.ignore_eos = true;
-        let body = to_vllm_request(&chat, "m");
+        let body = to_vllm_request(&chat, "m", SERVED_CONTEXT);
 
         assert_eq!(body["stop"], json!(["\n\n"]));
         assert_eq!(body["ignore_eos"], json!(true));
@@ -356,7 +420,7 @@ mod tests {
             tool_call_id: None,
         }]);
         chat.tool_choice = ToolChoice::Auto;
-        let body = to_vllm_request(&request(chat), "m");
+        let body = to_vllm_request(&request(chat), "m", SERVED_CONTEXT);
 
         let parts = body["messages"][0]["content"].as_array().expect("parts");
         assert_eq!(parts[0]["type"], json!("text"));
@@ -387,7 +451,11 @@ mod tests {
             tool_calls: Vec::new(),
             tool_call_id: Some("call_1".to_owned()),
         };
-        let body = to_vllm_request(&request(template(vec![assistant, result])), "m");
+        let body = to_vllm_request(
+            &request(template(vec![assistant, result])),
+            "m",
+            SERVED_CONTEXT,
+        );
 
         let turn = &body["messages"][0];
         assert_eq!(turn["role"], json!("assistant"));
@@ -414,7 +482,7 @@ mod tests {
             parameters: json!({ "type": "object", "properties": {} }),
         }];
         chat.parallel_tool_calls = false;
-        let body = to_vllm_request(&request(chat), "m");
+        let body = to_vllm_request(&request(chat), "m", SERVED_CONTEXT);
 
         assert_eq!(body["tools"][0]["type"], json!("function"));
         assert_eq!(body["tools"][0]["function"]["name"], json!("read_file"));
@@ -423,7 +491,7 @@ mod tests {
 
     #[test]
     fn omits_tool_members_entirely_when_no_tools_are_offered() {
-        let body = to_vllm_request(&request(template(vec![user("hi")])), "m");
+        let body = to_vllm_request(&request(template(vec![user("hi")])), "m", SERVED_CONTEXT);
 
         assert!(body.get("tools").is_none());
         assert!(body.get("parallel_tool_calls").is_none());
@@ -436,7 +504,7 @@ mod tests {
         let choice = |choice: ToolChoice| {
             let mut chat = template(vec![user("hi")]);
             chat.tool_choice = choice;
-            to_vllm_request(&request(chat), "m")
+            to_vllm_request(&request(chat), "m", SERVED_CONTEXT)
                 .get("tool_choice")
                 .cloned()
         };
@@ -472,7 +540,7 @@ mod tests {
         let format = |format: ResponseFormat| {
             let mut chat = template(vec![user("hi")]);
             chat.response_format = format;
-            to_vllm_request(&request(chat), "m")
+            to_vllm_request(&request(chat), "m", SERVED_CONTEXT)
                 .get("response_format")
                 .cloned()
         };
@@ -504,7 +572,7 @@ mod tests {
     fn disabled_reasoning_switches_the_template_off() {
         let mut chat = template(vec![user("hi")]);
         chat.reasoning = ReasoningControl::Disabled;
-        let body = to_vllm_request(&request(chat), "m");
+        let body = to_vllm_request(&request(chat), "m", SERVED_CONTEXT);
 
         assert_eq!(
             body["chat_template_kwargs"]["enable_thinking"],
@@ -518,7 +586,7 @@ mod tests {
         chat.reasoning = ReasoningControl::Enabled {
             budget_tokens: Some(2048),
         };
-        let body = to_vllm_request(&request(chat), "m");
+        let body = to_vllm_request(&request(chat), "m", SERVED_CONTEXT);
 
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], json!(true));
         // vLLM has no thinking-budget control; pretending otherwise would mislead the caller.
@@ -527,7 +595,7 @@ mod tests {
 
     #[test]
     fn model_default_reasoning_sends_no_template_arguments() {
-        let body = to_vllm_request(&request(template(vec![user("hi")])), "m");
+        let body = to_vllm_request(&request(template(vec![user("hi")])), "m", SERVED_CONTEXT);
 
         assert!(body.get("chat_template_kwargs").is_none());
     }
@@ -549,7 +617,7 @@ mod tests {
             explicit_budget_tokens: None,
             template_fingerprint: "fp".to_owned(),
         };
-        let kwargs = &to_vllm_request(&request(chat), "m")["chat_template_kwargs"];
+        let kwargs = &to_vllm_request(&request(chat), "m", SERVED_CONTEXT)["chat_template_kwargs"];
 
         // The resolved effort wins: otherwise the selected effort would be a lie.
         assert_eq!(kwargs["enable_thinking"], json!(false));
@@ -562,7 +630,7 @@ mod tests {
     fn caller_template_arguments_survive_without_any_reasoning_control() {
         let mut chat = template(vec![user("hi")]);
         chat.template_args = BTreeMap::from([("custom".to_owned(), json!("value"))]);
-        let body = to_vllm_request(&request(chat), "m");
+        let body = to_vllm_request(&request(chat), "m", SERVED_CONTEXT);
 
         assert_eq!(body["chat_template_kwargs"]["custom"], json!("value"));
     }

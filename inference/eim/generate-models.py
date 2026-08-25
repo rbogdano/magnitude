@@ -31,16 +31,18 @@ import sys
 
 GIB = 1024**3
 
-# Context served, capped at the model's trained maximum. Deliberately below that maximum for
-# larger models: on the CPU backend the KV cache is sized from this, and vLLM can refuse to start
-# when it does not fit. The plan's rule of thumb, pending measurement on real hardware.
+# Context served, capped at the model's trained maximum. On the CPU backend the KV cache is sized
+# from this and vLLM refuses to start when it does not fit, so it is bounded rather than maximal.
+#
+# 32768 up to 40B, now measured rather than guessed: a 30B mixture of experts at that context needs
+# 79 GiB against this host's 234 GiB budget, where the earlier 16384 saved 6 GiB it did not need to.
+# What forced the change is the other side of the window. An agent's system prompt and tool schemas
+# already occupy roughly 6000 tokens before the user types anything, so 16384 left too little for
+# the conversation and produced a request the engine refused outright.
+#
+# Beyond 40B it stays small: the only such model does not fit this host at any context.
 def served_context(total_parameters, max_position_embeddings):
-    if total_parameters <= 9_000_000_000:
-        wanted = 32_768
-    elif total_parameters <= 40_000_000_000:
-        wanted = 16_384
-    else:
-        wanted = 8_192
+    wanted = 32_768 if total_parameters <= 40_000_000_000 else 8_192
     return min(wanted, max_position_embeddings)
 
 
