@@ -1663,11 +1663,14 @@ const CatalogMenu = memo(function CatalogMenu({
   const catalogView = Result.value(useCatalogModels())
   const modelActions = useLocalModelActions()
   const slotActions = useModelSlotActions()
+  // Every assessed model, whether or not this host can serve it. A model that does not fit, is
+  // gated without a credential, or cannot have its tool calls parsed stays listed with a status
+  // saying so -- requiring `Fits` here hid most of a container-backed catalog and left no way to
+  // find out why an expected model was missing. Selecting and installing stay gated below.
   const catalogModels = Option.match(catalogView, {
     onNone: () => [],
     onSome: ({ models }) => models.filter(({ model }) =>
-      model.servingState._tag === "Assessed"
-        && model.servingState.assessment._tag === "Fits"),
+      model.servingState._tag === "Assessed"),
   })
   const recommendationsReady = Option.exists(
     catalogView,
@@ -1758,6 +1761,10 @@ const CatalogMenu = memo(function CatalogMenu({
 
   const primaryAction = useCallback((model: LocalModel) => {
     const configurationId = configurationIdFor(model)
+    // A model this host cannot serve is listed so its requirements are visible, but downloading it
+    // would spend tens of gigabytes on something that cannot then be loaded.
+    if (model.servingState._tag !== "Assessed"
+      || model.servingState.assessment._tag !== "Fits") return
     if (configurationId === undefined
       || model.acquisitionState._tag === "Downloading"
       || (model.acquisitionState._tag === "Installed"
