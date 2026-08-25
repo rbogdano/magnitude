@@ -44,6 +44,7 @@ fn stub_image() -> Option<String> {
 }
 
 const CONFIGURATION_ID: &str = "eim-stub-ctx8192";
+const ALTERNATE_CONFIGURATION_ID: &str = "eim-stub-alternate-ctx8192";
 
 /// A small model, so the fit estimate admits it on any developer machine.
 fn definition(image: &str) -> EimModelDefinition {
@@ -86,10 +87,20 @@ fn definition(image: &str) -> EimModelDefinition {
     }
 }
 
+/// A second configuration of the same stub image, so replacing one model with *another* can be
+/// told apart from re-loading the one already running.
+fn alternate_definition(image: &str) -> EimModelDefinition {
+    let mut alternate = definition(image);
+    alternate.configuration_id = ModelServingConfigurationId(ALTERNATE_CONFIGURATION_ID.to_owned());
+    alternate.package_id = ModelPackageId("eim--stub--model--alternate".to_owned());
+    alternate.catalog_model_id = "stub-model-alternate".to_owned();
+    alternate
+}
+
 fn controller(image: &str) -> EimModelInstanceController {
     EimModelInstanceController::new(
         DockerCli::default(),
-        vec![definition(image)],
+        vec![definition(image), alternate_definition(image)],
         EimControllerConfig {
             icn_instance_id: format!("itest-{}", std::process::id()),
             host_cache_path: PathBuf::from("/tmp/magnitude-eim-itest-cache"),
@@ -140,6 +151,22 @@ async fn load(controller: &EimModelInstanceController, instance_id: &str) -> Vec
         .load_instance(LoadModelRequest {
             instance_id: ModelInstanceId(instance_id.to_owned()),
             configuration: configuration(),
+        })
+        .collect()
+        .await
+}
+
+async fn load_alternate(
+    controller: &EimModelInstanceController,
+    instance_id: &str,
+) -> Vec<ModelLoadEvent> {
+    controller
+        .load_instance(LoadModelRequest {
+            instance_id: ModelInstanceId(instance_id.to_owned()),
+            configuration: ModelServingConfiguration {
+                id: ModelServingConfigurationId(ALTERNATE_CONFIGURATION_ID.to_owned()),
+                ..configuration()
+            },
         })
         .collect()
         .await
@@ -311,7 +338,7 @@ fn chat_request() -> ChatRequest {
 }
 
 #[tokio::test]
-async fn replacing_a_model_terminalizes_the_previous_instance() {
+async fn reloading_the_same_configuration_reuses_the_running_container() {
     let _daemon = DAEMON.lock().await;
     let Some(image) = stub_image() else {
         eprintln!("skipped: set MAGNITUDE_EIM_STUB_IMAGE to run this");
@@ -335,24 +362,67 @@ async fn replacing_a_model_terminalizes_the_previous_instance() {
             _ => None,
         })
         .collect();
+    let snapshot = controller.instances().await;
+    cleanup(&controller).await;
 
-    // One container at a time: the replacement must unload the incumbent first.
-    assert!(stages.contains(&ModelLoadStage::Unloading), "{stages:?}");
+    // The client re-asks for a load whenever a rebuild loses its slot-to-instance binding, which
+    // happens on any rebuild that sees an empty offering list. Tearing the model down to answer
+    // that cost a full load on every message.
+    assert!(
+        !stages.contains(&ModelLoadStage::Unloading),
+        "a model already serving this configuration must not be unloaded: {stages:?}"
+    );
+    assert!(
+        second
+            .iter()
+            .any(|event| matches!(event, ModelLoadEvent::Ready { ready }
+                if ready.instance_id == ModelInstanceId("instance-second".to_owned()))),
+        "ready under the requested identity: {second:?}"
+    );
+    assert_eq!(snapshot.instances.len(), 1);
+    assert_eq!(
+        snapshot.instances[0].id,
+        ModelInstanceId("instance-second".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn replacing_a_model_terminalizes_the_previous_instance() {
+    let _daemon = DAEMON.lock().await;
+    let Some(image) = stub_image() else {
+        eprintln!("skipped: set MAGNITUDE_EIM_STUB_IMAGE to run this");
+        return;
+    };
+    let controller = controller(&image);
+
+    let first = load(&controller, "instance-first").await;
+    assert!(
+        first
+            .iter()
+            .any(|event| matches!(event, ModelLoadEvent::Ready { .. })),
+        "{first:?}"
+    );
+
+    // A *different* configuration, which is what replacement means.
+    let second = load_alternate(&controller, "instance-second").await;
+    let stages: Vec<_> = second
+        .iter()
+        .filter_map(|event| match event {
+            ModelLoadEvent::Progress { stage, .. } => Some(*stage),
+            _ => None,
+        })
+        .collect();
 
     let snapshot = controller.instances().await;
     cleanup(&controller).await;
 
-    assert_eq!(snapshot.instances.len(), 1, "only one instance is resident");
-    assert_eq!(snapshot.instances[0].id.0, "instance-second");
-
-    // A lease naming the replaced instance must fail rather than be served by its successor.
-    let stale = controller
-        .lease(
-            ModelInstanceId("instance-first".to_owned()),
-            ModelServingConfigurationId(CONFIGURATION_ID.to_owned()),
-        )
-        .await;
-    assert!(stale.is_err(), "a stale instance must not be leasable");
+    // One container at a time: the replacement must unload the incumbent first.
+    assert!(stages.contains(&ModelLoadStage::Unloading), "{stages:?}");
+    assert_eq!(snapshot.instances.len(), 1);
+    assert_eq!(
+        snapshot.instances[0].id,
+        ModelInstanceId("instance-second".to_owned())
+    );
 }
 
 #[tokio::test]

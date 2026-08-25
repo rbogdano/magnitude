@@ -735,6 +735,45 @@ impl ModelInstanceController for EimModelInstanceController {
         // and, more importantly, the working resident is not taken away on the strength of a
         // request that cannot be served.
         let servable = self.shared.definition(&request.configuration.id).is_ok();
+
+        // Already serving exactly this configuration? Adopt the request's instance identity onto
+        // the running container instead of replacing it. The identity is the client's handle; the
+        // container is the resource, and re-identifying one that is already Ready is what reuse
+        // means here. Restarting instead cost a full load on every turn: the client loses its
+        // slot-to-instance binding on any rebuild where the offering list is momentarily empty,
+        // asks for a load it does not need, and a healthy model was torn down to answer it.
+        let adopted = {
+            let mut state = self.shared.state.lock().expect("controller state lock");
+            match state.resident.as_mut() {
+                Some(resident)
+                    if servable
+                        && resident.configuration_id == request.configuration.id
+                        && matches!(resident.lifecycle, ModelInstanceLifecycle::Ready { .. }) =>
+                {
+                    resident.instance_id = request.instance_id.clone();
+                    resident.last_activity = Instant::now();
+                    match &resident.lifecycle {
+                        ModelInstanceLifecycle::Ready { allocation } => Some(allocation.clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        };
+        if let Some(allocation) = adopted {
+            self.shared.bump_revision();
+            let (events, receiver) = mpsc::channel(1);
+            // Best effort: the snapshot already says Ready, which is what the client acts on.
+            let _ = events.try_send(ModelLoadEvent::Ready {
+                ready: LoadModelReady {
+                    instance_id: request.instance_id.clone(),
+                    configuration_id: request.configuration.id.clone(),
+                    allocation,
+                },
+            });
+            return ReceiverStream::new(receiver).boxed();
+        }
+
         let previous = if !servable {
             None
         } else {
@@ -1614,6 +1653,87 @@ mod tests {
             "{:?}",
             instance.lifecycle
         );
+    }
+
+    #[tokio::test]
+    async fn loading_a_configuration_already_ready_reuses_the_container() {
+        // The client loses its slot-to-instance binding whenever a rebuild sees an empty offering
+        // list, then asks for a load it does not need. Tearing the running model down to answer
+        // that cost a full load on every message; the identity is the client's handle, so it is
+        // adopted onto the container that is already serving.
+        let controller = controller();
+        let shape = ServingShape {
+            context_tokens: definition().context_tokens,
+            parallel_sequences: 1,
+            tensor_parallel_size: definition().tensor_parallel_size,
+        };
+        let estimate = MemoryEstimate::compute(&definition().geometry, &shape);
+        let ready = ModelInstanceLifecycle::Ready {
+            allocation: allocation_of(&shape, &estimate),
+        };
+        {
+            let mut state = controller
+                .shared
+                .state
+                .lock()
+                .expect("controller state lock");
+            state.resident = Some(Resident {
+                instance_id: ModelInstanceId("first".to_owned()),
+                configuration_id: definition().configuration_id,
+                container_name: "magnitude-eim-test-first".to_owned(),
+                lifecycle: ready,
+                backend: None,
+                last_activity: Instant::now(),
+            });
+        }
+
+        let events: Vec<_> = controller
+            .load_instance(LoadModelRequest {
+                instance_id: ModelInstanceId("second".to_owned()),
+                configuration: icn_contracts::models::ModelServingConfiguration {
+                    id: definition().configuration_id,
+                    bundle: icn_contracts::models::ServableModelBundle::Standalone {
+                        package: test_package(),
+                    },
+                    profile: icn_contracts::models::ServingProfile {
+                        context_length: definition().context_tokens,
+                    },
+                },
+            })
+            .collect()
+            .await;
+
+        // Ready at once, under the identity the caller asked for.
+        assert!(
+            matches!(events.first(), Some(ModelLoadEvent::Ready { ready }) if ready.instance_id
+                == ModelInstanceId("second".to_owned())),
+            "{events:?}"
+        );
+        let snapshot = controller.instances().await;
+        assert_eq!(snapshot.instances.len(), 1);
+        assert_eq!(
+            snapshot.instances[0].id,
+            ModelInstanceId("second".to_owned())
+        );
+        assert!(matches!(
+            snapshot.instances[0].lifecycle,
+            ModelInstanceLifecycle::Ready { .. }
+        ));
+        // The container was never touched, which is the whole point.
+        let container = {
+            let state = controller
+                .shared
+                .state
+                .lock()
+                .expect("controller state lock");
+            state
+                .resident
+                .as_ref()
+                .expect("a resident")
+                .container_name
+                .clone()
+        };
+        assert_eq!(container, "magnitude-eim-test-first");
     }
 
     #[tokio::test]
