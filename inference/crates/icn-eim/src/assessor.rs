@@ -179,23 +179,14 @@ fn assessment(
     ));
     let memory = vec![memory_assessment(&estimate, host)];
 
-    // The engine cannot parse this model's tool calls, so the agent cannot use it. Reported as
-    // incompatible rather than as a fit, because "it loads but the agent loop silently fails" is
-    // the worse of the two answers to give.
-    if definition.tool_call_parser.is_none() {
-        return ModelAssessment::Incompatible {
-            configuration,
-            failure: ModelFailure {
-                code: "eim_no_tool_call_parser".to_owned(),
-                message: format!(
-                    "no vLLM tool-call parser is known for {}, so the agent cannot use it",
-                    definition.canonical_name
-                ),
-                retryable: false,
-            },
-        };
-    }
-
+    // A model whose tool calls the engine cannot parse is still assessed on its merits. It fits or
+    // it does not; what it cannot do is drive the agent loop, and that travels in its declared
+    // capabilities (`tools: false`) and its notes instead.
+    //
+    // Reporting it `Incompatible` here was the mistake: the client's projections drop anything that
+    // is not `Fits`, so the model vanished from every picker rather than appearing with a reason.
+    // Hiding it is the one outcome the catalog exists to prevent -- a user who expects a model and
+    // cannot find out why it is absent learns nothing.
     let reserve = host.total_bytes.saturating_sub(host.stable_bytes);
     if estimate.required_bytes > host.stable_bytes {
         return ModelAssessment::DoesNotFit {
@@ -379,8 +370,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_model_with_no_tool_call_parser_is_incompatible_rather_than_fitting() {
-        // It would load. Reporting it as a fit is what lets the agent loop fail silently.
+    async fn a_model_with_no_tool_call_parser_still_fits_and_stays_visible() {
+        // It loads and it holds a conversation; what it cannot do is drive the agent loop. Marking
+        // it `Incompatible` removed it from every picker, because the client's projections keep only
+        // `Fits` — so the user could not learn why a model they expected was missing. The limitation
+        // travels in the catalog's `tools: false` and its notes instead.
         let mut definition = crate::controller::tests_support::definition();
         definition.tool_call_parser = None;
 
@@ -392,13 +386,11 @@ mod tests {
         let AssessModelResult::Assessed { profiles, .. } = &response.results[0] else {
             panic!("expected Assessed");
         };
-        match &profiles[0] {
-            ModelAssessment::Incompatible { failure, .. } => {
-                assert_eq!(failure.code, "eim_no_tool_call_parser");
-                assert!(!failure.retryable);
-            }
-            other => panic!("expected Incompatible, got {other:?}"),
-        }
+        assert!(
+            matches!(profiles[0], ModelAssessment::Fits { .. }),
+            "a tool-less model must remain offerable, got {:?}",
+            profiles[0]
+        );
         assert!(profiles[0].is_valid_for(&topology()));
     }
 
