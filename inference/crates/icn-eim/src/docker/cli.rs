@@ -11,7 +11,10 @@ use serde::Deserialize;
 use tokio::process::Command;
 
 use super::inspect::{ContainerState, ImageSummary};
-use super::naming::{ICN_INSTANCE_LABEL, OWNER_LABEL, OWNER_VALUE, OwnedContainer, PID_LABEL};
+use super::naming::{
+    CONFIGURATION_LABEL, ICN_INSTANCE_LABEL, MODEL_INSTANCE_LABEL, OWNER_LABEL, OWNER_VALUE,
+    OwnedContainer, PID_LABEL,
+};
 
 /// One completed `docker` process, kept for diagnostics.
 #[derive(Clone, Debug)]
@@ -492,6 +495,10 @@ impl DockerCli {
                 names: String,
                 #[serde(rename = "Labels", default)]
                 labels: String,
+                #[serde(rename = "State", default)]
+                state: String,
+                #[serde(rename = "Ports", default)]
+                ports: String,
             }
             let raw: RawPs = serde_json::from_str(line).map_err(|source| DockerError::Decode {
                 source,
@@ -503,10 +510,29 @@ impl DockerCli {
                 name: raw.names,
                 icn_instance_id: labels.get(ICN_INSTANCE_LABEL).cloned(),
                 pid: labels.get(PID_LABEL).and_then(|pid| pid.parse().ok()),
+                configuration_id: labels.get(CONFIGURATION_LABEL).cloned(),
+                model_instance_id: labels.get(MODEL_INSTANCE_LABEL).cloned(),
+                host_port: parse_published_port(&raw.ports),
+                running: raw.state == "running",
             });
         }
         Ok(owned)
     }
+}
+
+/// Reads the loopback port from `docker ps`'s `Ports` column.
+///
+/// Rendered as `127.0.0.1:41234->8000/tcp`, possibly several comma-separated entries. Only the
+/// mapping to the container's own port matters, since that is the served API.
+fn parse_published_port(ports: &str) -> Option<u16> {
+    ports.split(',').find_map(|entry| {
+        let entry = entry.trim();
+        let (published, target) = entry.split_once("->")?;
+        if !target.starts_with(&crate::env_contract::CONTAINER_PORT.to_string()) {
+            return None;
+        }
+        published.rsplit(':').next()?.parse().ok()
+    })
 }
 
 /// `docker ps --format '{{json .}}'` renders labels as a comma-separated `key=value` string.
@@ -598,6 +624,33 @@ mod tests {
 
         assert!(!args.contains(&"--memory".to_owned()));
         assert!(!args.contains(&"--memory-swap".to_owned()));
+    }
+
+    #[test]
+    fn reads_the_published_loopback_port_docker_reports() {
+        // What `docker ps` renders for a container this controller started. Reading it back is
+        // what lets a successor reach a model it did not start itself.
+        assert_eq!(
+            parse_published_port("127.0.0.1:40767->8000/tcp"),
+            Some(40_767)
+        );
+    }
+
+    #[test]
+    fn ignores_a_mapping_to_a_port_the_engine_does_not_serve() {
+        // The served API is always on the container's own port; anything else is not it.
+        assert_eq!(parse_published_port("127.0.0.1:40767->9000/tcp"), None);
+        assert_eq!(
+            parse_published_port("127.0.0.1:5000->9000/tcp, 127.0.0.1:40767->8000/tcp"),
+            Some(40_767)
+        );
+    }
+
+    #[test]
+    fn an_unpublished_container_reports_no_port() {
+        // Nothing to adopt: without a published port the server cannot be reached at all.
+        assert_eq!(parse_published_port(""), None);
+        assert_eq!(parse_published_port("8000/tcp"), None);
     }
 
     #[test]

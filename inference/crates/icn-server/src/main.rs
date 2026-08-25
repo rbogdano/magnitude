@@ -280,10 +280,15 @@ async fn main() -> anyhow::Result<()> {
                     },
                     tokio::runtime::Handle::current(),
                 ));
-                // Before serving, remove containers a killed predecessor left holding memory.
-                let reaped = eim.reap_orphans().await;
-                if !reaped.is_empty() {
-                    tracing::info!(?reaped, "removed orphaned containers");
+                // Reconnect to a model a previous ICN left running, and remove what cannot be
+                // used. Adoption is what makes restarting the client cheap; removal is what stops
+                // an unusable container from holding tens of gigabytes nothing can address.
+                let containers = eim.reconcile_containers().await;
+                if let Some(adopted) = &containers.adopted {
+                    tracing::info!(container = %adopted, "adopted a running model");
+                }
+                if !containers.removed.is_empty() {
+                    tracing::info!(removed = ?containers.removed, "removed unusable containers");
                 }
                 // ACN calls GET /v1/models while building its layer graph and fails to become
                 // ready if it errors, so the catalog is not optional.
@@ -356,9 +361,6 @@ async fn main() -> anyhow::Result<()> {
             if let Some(assessor) = assessor {
                 state = state.with_model_assessor(assessor);
             }
-            // Kept for the shutdown path: the state builder consumes the controller, and a
-            // detached container has to be released by name once serving ends.
-            let released = controller.clone();
             if let Some(controller) = controller {
                 state = state.with_model_controller(controller);
             }
@@ -398,15 +400,11 @@ async fn main() -> anyhow::Result<()> {
                 .with_graceful_shutdown(interrupt_signal())
                 .await?;
 
-            // A detached container outlives the process that started it, so shutdown has to say so
-            // explicitly. Skipping this leaves the whole model's memory held until some later ICN
-            // starts and reaps it.
-            if let Some(controller) = &released {
-                let released = controller.release_owned().await;
-                if !released.is_empty() {
-                    tracing::info!(?released, "released containers on shutdown");
-                }
-            }
+            // The container is deliberately left running. It takes minutes to start and outliving
+            // the process that started it is what a container is for, so the next ICN adopts it
+            // instead of paying for a reload — see `reconcile_containers`. The cost is that a
+            // model stays resident after the client closes, until some later ICN decides whether
+            // it is still usable.
             tracing::info!("ICN server stopped");
         }
         Command::Doctor { json } => {

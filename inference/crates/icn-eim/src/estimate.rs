@@ -423,10 +423,6 @@ mod tests {
         }
     }
 
-    /// What the Xeon 6767P reports per NUMA node: vLLM's own error message named
-    /// 125.94 GiB, which is half of the host's 251 GiB.
-    const NODE_CAPACITY_BYTES: u64 = 135_236_616_192;
-
     /// What vLLM 0.26 reported on the Xeon at a 32.72 GiB ceiling, and what the engine already
     /// held when it checked. Kept as constants because they are the only evidence for the formula.
     const MEASURED_LIMIT_GIB: f64 = 32.72;

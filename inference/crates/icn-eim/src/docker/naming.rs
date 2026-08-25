@@ -84,6 +84,16 @@ pub struct OwnedContainer {
     pub name: String,
     pub icn_instance_id: Option<String>,
     pub pid: Option<u32>,
+    /// Which serving configuration it was started for, so a successor can tell whether the model
+    /// it is serving is still one this build knows how to address.
+    pub configuration_id: Option<String>,
+    /// The instance identity its owner published, carried forward when a successor adopts it.
+    pub model_instance_id: Option<String>,
+    /// Loopback port the served API is published on, read back so a successor can reach it without
+    /// having recorded anything itself.
+    pub host_port: Option<u16>,
+    /// Whether the container is running right now, as opposed to exited.
+    pub running: bool,
 }
 
 impl OwnedContainer {
@@ -158,6 +168,10 @@ mod tests {
             name: "magnitude-eim-icn-1-mi-1".to_owned(),
             icn_instance_id: Some("icn-1".to_owned()),
             pid: Some(OURS),
+            configuration_id: None,
+            model_instance_id: None,
+            host_port: None,
+            running: true,
         };
 
         // Even a liveness check that claims nothing is alive must not reach our own container.
@@ -171,6 +185,10 @@ mod tests {
             name: "magnitude-eim-icn-0-mi-9".to_owned(),
             icn_instance_id: Some("icn-0".to_owned()),
             pid: Some(999_999),
+            configuration_id: None,
+            model_instance_id: None,
+            host_port: None,
+            running: true,
         };
 
         assert!(container.is_orphan_of(OURS, |_| false));
@@ -189,6 +207,10 @@ mod tests {
             name: "magnitude-eim-icn-1-mi-1".to_owned(),
             icn_instance_id: Some("icn-1".to_owned()),
             pid: Some(999_999),
+            configuration_id: None,
+            model_instance_id: None,
+            host_port: None,
+            running: true,
         };
 
         assert!(
@@ -204,6 +226,10 @@ mod tests {
             name: "magnitude-eim-unknown".to_owned(),
             icn_instance_id: None,
             pid: None,
+            configuration_id: None,
+            model_instance_id: None,
+            host_port: None,
+            running: true,
         };
 
         assert!(container.is_orphan_of(OURS, |_| true));

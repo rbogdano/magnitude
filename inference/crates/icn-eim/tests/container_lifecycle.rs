@@ -8,6 +8,7 @@
 //!   MAGNITUDE_EIM_STUB_IMAGE=magnitude-eim-stub:test \
 //!     cargo test -p icn-eim --test container_lifecycle
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -25,6 +26,8 @@ use icn_contracts::{
 };
 use icn_eim::controller::{EimControllerConfig, EimModelDefinition, EimModelInstanceController};
 use icn_eim::docker::DockerCli;
+use icn_eim::docker::cli::ContainerSpec;
+use icn_eim::docker::naming::ContainerLabels;
 use icn_eim::estimate::ModelGeometry;
 use icn_eim::properties::ReasoningDeclaration;
 use icn_eim::readiness::ReadinessConfig;
@@ -36,6 +39,15 @@ use icn_eim::readiness::ReadinessConfig;
 /// `rw layer snapshot not found for container ...`, which reads exactly like a product bug and is
 /// not one. Cargo runs tests in a thread pool by default, so the exclusion has to be explicit.
 static DAEMON: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A free loopback port, so a test never collides with whatever else is listening.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("a free port")
+        .local_addr()
+        .expect("a bound address")
+        .port()
+}
 
 fn stub_image() -> Option<String> {
     std::env::var("MAGNITUDE_EIM_STUB_IMAGE")
@@ -335,6 +347,99 @@ fn chat_request() -> ChatRequest {
         ignore_eos: false,
         timings_per_token: false,
     }
+}
+
+#[tokio::test]
+async fn a_running_model_left_by_a_dead_icn_is_adopted_rather_than_destroyed() {
+    let _daemon = DAEMON.lock().await;
+    let Some(image) = stub_image() else {
+        eprintln!("skipped: set MAGNITUDE_EIM_STUB_IMAGE to run this");
+        return;
+    };
+    let docker = DockerCli::default();
+    let name = "magnitude-eim-adopt-itest";
+    let _ = docker.stop(name, 2).await;
+    let _ = docker.remove(name).await;
+
+    // A container carrying this configuration and a dead owner, which is exactly what a client
+    // that closed mid-session leaves behind. Starting a serving container takes minutes, so
+    // destroying it made every restart cost a reload.
+    let port = free_port();
+    docker
+        .run(&ContainerSpec {
+            name: name.to_owned(),
+            image: image.clone(),
+            host_port: port,
+            container_port: 8000,
+            labels: ContainerLabels {
+                icn_instance_id: "a-previous-icn".to_owned(),
+                model_instance_id: "instance-from-before".to_owned(),
+                configuration_id: CONFIGURATION_ID.to_owned(),
+                catalog_model_id: "stub-model".to_owned(),
+                eim_profile_id: "vllm-xeon-bf16-tp1".to_owned(),
+                // A pid that cannot be running, so the owner reads as gone.
+                pid: 999_999,
+            }
+            .to_args(),
+            environment: BTreeMap::new(),
+            mounts: Vec::new(),
+            memory_limit_bytes: None,
+            stop_timeout_seconds: 5,
+            shm_size_bytes: None,
+            capabilities: Vec::new(),
+            command: Vec::new(),
+        })
+        .await
+        .expect("the abandoned container should start");
+
+    // Give the stub a moment to answer, since adoption declines anything that does not.
+    for _ in 0..40 {
+        if reqwest::get(format!("http://127.0.0.1:{port}/health"))
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let controller = controller(&image);
+    let outcome = controller.reconcile_containers().await;
+    let snapshot = controller.instances().await;
+    let leased = controller
+        .lease(
+            ModelInstanceId("instance-from-before".to_owned()),
+            ModelServingConfigurationId(CONFIGURATION_ID.to_owned()),
+        )
+        .await;
+    cleanup(&controller).await;
+    let _ = docker.stop(name, 2).await;
+    let _ = docker.remove(name).await;
+
+    assert_eq!(outcome.adopted.as_deref(), Some(name), "{outcome:?}");
+    // Whatever else the shared daemon was holding may be swept; the adopted one must not be.
+    assert!(
+        !outcome.removed.iter().any(|removed| removed == name),
+        "the adopted container must not also be removed: {outcome:?}"
+    );
+    // Published as Ready under the identity its previous owner recorded, so a client holding that
+    // identity still resolves.
+    assert_eq!(snapshot.instances.len(), 1);
+    assert_eq!(
+        snapshot.instances[0].id,
+        ModelInstanceId("instance-from-before".to_owned())
+    );
+    assert!(matches!(
+        snapshot.instances[0].lifecycle,
+        ModelInstanceLifecycle::Ready { .. }
+    ));
+    // And usable: adoption without a working backend would be a model the client believes in and
+    // cannot address.
+    assert!(
+        leased.is_ok(),
+        "an adopted model must be usable: {:?}",
+        leased.err()
+    );
 }
 
 #[tokio::test]

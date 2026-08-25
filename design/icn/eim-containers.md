@@ -171,13 +171,21 @@ across restarts, so a successor carries its predecessor's id and would otherwise
 cannot use. The container name is derived from the same identity, so an adopted container also makes
 the model unservable until someone removes it by hand.
 
-Shutdown releases what this process owns, and that is a separate job from reaping: the reaper skips
-containers whose owner is alive, and on the way out that owner is us. A clean exit that skipped it
-would leave the whole model's memory held until some later ICN happened to start.
+A container is **not** released when its ICN exits, and an abandoned healthy one is **adopted** by
+the next ICN rather than destroyed. That is the opposite of the original rule here, and the reason is
+that the original rule made a serving container as short-lived as the process that started it: a
+client restart — or any hiccup that ended one — cost a full multi-minute reload, which read as the
+model dying rather than as bookkeeping.
 
-None of this is optional bookkeeping. The client's shutdown ends in `SIGKILL` after a short grace
-period, so the boot-time sweep is the only thing standing between that and tens of gigabytes held by
-an invisible container.
+Outliving the process that started it is what a container is for. Adoption reconnects: the
+configuration is read from the container's own label, the served name from the running server, and
+the instance identity is carried forward from the label so a client holding it still resolves.
+
+Adoption declines on anything it cannot verify — a stopped container, an unpublished port, a
+configuration absent from the table, a server that does not answer — and what it declines is
+removed. That is what keeps the change from leaking: a container nothing can address is worse than
+no container. The cost is deliberate and worth stating: a model stays resident after the client
+closes, until some later ICN decides whether it is still usable.
 
 ## Failures name their cause
 
@@ -198,8 +206,8 @@ configuration mistake is not.
   does not is a model the client cannot offer or explain.
 - A container that dies during startup is detected from its state within one poll interval, not by
   waiting out the readiness budget.
-- Stopping an instance removes its container, and a restarted ICN reaps what a killed predecessor
-  left behind.
+- Stopping an instance removes its container. A restarted ICN adopts a healthy one its predecessor
+  left running, and removes one it cannot verify.
 - Selecting any listed, serveable model installs it and then serves it: the image is prepared, the
   weights are fetched with byte-accurate progress, and the model reaches Ready.
 - Uninstalling reclaims the weights as well as the image.

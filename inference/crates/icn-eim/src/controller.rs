@@ -37,13 +37,15 @@ use tokio_stream::wrappers::{ReceiverStream, WatchStream};
 use crate::docker::DockerCli;
 use crate::docker::cli::{ContainerSpec, ProxySettings};
 use crate::docker::image::{ImageError, ImageResolver, ImageSource};
+use crate::docker::naming::OwnedContainer;
 use crate::docker::naming::{ContainerLabels, container_name};
 use crate::env_contract::{CONTAINER_PORT, LaunchEnvironment};
 use crate::estimate::{HostBudget, MemoryEstimate, ModelGeometry, ServingShape};
 use crate::memory::SystemMemoryObserver;
 use crate::properties::{ModelPropertiesSpec, ReasoningDeclaration};
 use crate::readiness::{
-    DockerContainerWatch, HttpServerProbe, ReadinessConfig, ReadinessOutcome, await_ready,
+    DockerContainerWatch, HttpServerProbe, ReadinessConfig, ReadinessOutcome, ServerProbe,
+    await_ready,
 };
 
 /// Everything the controller needs to serve one catalog model.
@@ -373,60 +375,155 @@ impl EimModelInstanceController {
     /// Runs at boot. Without it a `SIGKILL`ed ICN — which is exactly how the client's shutdown
     /// ends if the graceful window elapses — leaves a container holding tens of gigabytes with
     /// nothing tracking it.
-    /// Removes every container this process owns, on the way out.
+    /// What a boot-time reconciliation did with the containers it found.
     ///
-    /// Not the same job as `reap_orphans`, which skips containers whose owner is alive — and on the
-    /// shutdown path that owner is us. Without this a clean shutdown leaves the resident container
-    /// running and holding the whole model's memory until some later ICN starts and reaps it, which
-    /// for a user who closes Magnitude and does not reopen it is indefinitely.
-    pub async fn release_owned(&self) -> Vec<String> {
-        let owned = match self.shared.docker.list_owned().await {
-            Ok(owned) => owned,
-            Err(error) => {
-                tracing::warn!(%error, "could not list ICN-owned containers on shutdown");
-                return Vec::new();
-            }
-        };
-        let ours = std::process::id();
-        let mut released = Vec::new();
-        for container in owned {
-            if container.pid != Some(ours) {
-                continue;
-            }
-            tracing::info!(container = %container.name, "releasing container on shutdown");
-            let _ = self.shared.docker.stop(&container.name, 10).await;
-            if self.shared.docker.remove(&container.name).await.is_ok() {
-                released.push(container.name);
-            }
-        }
-        released
-    }
-
-    pub async fn reap_orphans(&self) -> Vec<String> {
+    /// Adoption is the point. A serving container takes minutes to start and outliving the process
+    /// that started it is what containers are for, so a healthy one whose owner is gone is
+    /// reconnected to rather than destroyed — otherwise every client restart cost a full reload,
+    /// and any hiccup in the client read as the model dying.
+    ///
+    /// What is still removed is what cannot be used: a container that has exited, one serving a
+    /// configuration this build no longer knows, or one that does not answer. Keeping those would
+    /// leak tens of gigabytes with nothing able to address them.
+    pub async fn reconcile_containers(&self) -> ContainerReconciliation {
+        let mut outcome = ContainerReconciliation::default();
         let owned = match self.shared.docker.list_owned().await {
             Ok(owned) => owned,
             Err(error) => {
                 tracing::warn!(%error, "could not list ICN-owned containers");
-                return Vec::new();
+                return outcome;
             }
         };
-        let mut reaped = Vec::new();
+
         for container in owned {
             if !container.is_orphan_of(std::process::id(), pid_is_alive) {
                 continue;
             }
-            tracing::info!(
-                container = %container.name,
-                owner = ?container.icn_instance_id,
-                "removing orphaned container"
-            );
-            let _ = self.shared.docker.stop(&container.name, 5).await;
-            if self.shared.docker.remove(&container.name).await.is_ok() {
-                reaped.push(container.name);
+            match self.adopt(&container).await {
+                Some(name) => {
+                    tracing::info!(
+                        container = %name,
+                        configuration = ?container.configuration_id,
+                        "adopted a running model from a previous ICN"
+                    );
+                    outcome.adopted = Some(name);
+                    // At most one model is resident, so the rest cannot be used whatever their
+                    // state. Fall through to removal for them.
+                }
+                None => {
+                    tracing::info!(
+                        container = %container.name,
+                        owner = ?container.icn_instance_id,
+                        "removing a container that cannot be adopted"
+                    );
+                    let _ = self.shared.docker.stop(&container.name, 5).await;
+                    if self.shared.docker.remove(&container.name).await.is_ok() {
+                        outcome.removed.push(container.name);
+                    }
+                }
             }
         }
-        reaped
+        outcome
     }
+
+    /// Reconnects to one abandoned container, or declines and says nothing.
+    ///
+    /// Declines on anything it cannot verify: a stopped container, an unpublished port, a
+    /// configuration absent from the table, a server that does not answer. Adopting on a guess
+    /// would produce a model the client believes in and cannot use.
+    async fn adopt(&self, container: &OwnedContainer) -> Option<String> {
+        if !container.running {
+            return None;
+        }
+        {
+            // One resident at a time, so a second candidate is not adopted even if it is healthy.
+            let state = self.shared.state.lock().expect("controller state lock");
+            if state.resident.is_some() {
+                return None;
+            }
+        }
+        let configuration_id = ModelServingConfigurationId(container.configuration_id.clone()?);
+        let definition = self.shared.definition(&configuration_id).ok()?;
+        let host_port = container.host_port?;
+        let endpoint = format!("http://127.0.0.1:{host_port}");
+
+        // The served name is read from the running server rather than assumed, exactly as the load
+        // path does: vLLM validates requests against its own name. A container that does not answer
+        // both of these is not adoptable, whatever Docker thinks of its health.
+        let probe = HttpServerProbe::new(endpoint.clone()).ok()?;
+        if probe.health().await.ok()? != 200 {
+            return None;
+        }
+        let served_model_name =
+            crate::readiness::parse_served_model_name(&probe.models().await.ok()?)
+                .unwrap_or_else(|| definition.canonical_name.clone());
+        let image = self
+            .shared
+            .docker
+            .image_summary(&definition.image)
+            .await
+            .ok()??;
+        let (shape, estimate) = self.shared.plan(&definition).ok()?;
+
+        let properties = ModelPropertiesSpec {
+            served_model_name: served_model_name.clone(),
+            container_model_path: PathBuf::from(crate::env_contract::CONTAINER_CACHE_PATH)
+                .join(&definition.canonical_name),
+            model_size_bytes: definition.weight_bytes,
+            architecture: definition.architecture.clone(),
+            context_tokens: shape.context_tokens,
+            training_context_tokens: definition.geometry.max_position_embeddings,
+            sliding_window_tokens: definition.sliding_window_tokens,
+            tools: definition.tool_call_parser.is_some(),
+            reasoning: definition.reasoning.clone(),
+            modalities: definition.modalities,
+            image_digest: image.content_digest.clone(),
+            eim_profile_id: definition.eim_profile_id.clone(),
+        }
+        .to_model_properties();
+
+        let backend = crate::backend::EimCompletionBackend::new(
+            configuration_id.0.clone(),
+            endpoint,
+            served_model_name,
+            properties,
+            self.shared.runtime.clone(),
+        )
+        .ok()?;
+
+        // The previous owner's instance identity is carried forward when it recorded one, so a
+        // client holding it still resolves. A fresh one is minted otherwise.
+        let instance_id = ModelInstanceId(
+            container
+                .model_instance_id
+                .clone()
+                .unwrap_or_else(|| format!("adopted-{}", container.id)),
+        );
+        {
+            let mut state = self.shared.state.lock().expect("controller state lock");
+            state.resident = Some(Resident {
+                instance_id,
+                configuration_id,
+                container_name: container.name.clone(),
+                lifecycle: ModelInstanceLifecycle::Ready {
+                    allocation: allocation_of(&shape, &estimate),
+                },
+                backend: Some(Arc::new(backend) as Arc<dyn CompletionBackend>),
+                last_activity: Instant::now(),
+            });
+        }
+        self.shared.bump_revision();
+        Some(container.name.clone())
+    }
+}
+
+/// The result of reconciling the containers found at boot.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContainerReconciliation {
+    /// The container reconnected to, if one was usable.
+    pub adopted: Option<String>,
+    /// Containers removed because nothing could address them.
+    pub removed: Vec<String>,
 }
 
 /// Whether a recorded owner process is still running.
@@ -2025,7 +2122,9 @@ mod tests {
     #[tokio::test]
     async fn reaping_tolerates_an_unreachable_daemon() {
         // Boot must not fail because Docker is briefly unavailable; the preflight reports that.
-        assert!(controller().reap_orphans().await.is_empty());
+        let outcome = controller().reconcile_containers().await;
+        assert!(outcome.adopted.is_none());
+        assert!(outcome.removed.is_empty());
     }
 
     #[test]
